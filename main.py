@@ -84,13 +84,20 @@ SESSIONS: dict[str, tuple[int, int]] = {
 # ─────────────────────────────────────────────
 
 import sys
+
+# Cross-platform UTF-8 logging (works on Windows cp1252 and Linux)
+_file_handler   = logging.FileHandler("muesa.log", encoding="utf-8")
+_stream_handler = logging.StreamHandler(sys.stdout)
+try:
+    # Windows: reconfigure stdout to UTF-8 if possible
+    sys.stdout.reconfigure(encoding="utf-8")
+except AttributeError:
+    pass  # Linux/already UTF-8 — no action needed
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("muesa.log", encoding="utf-8"),
-        logging.StreamHandler(stream=open(sys.stdout.fileno(), mode="w", encoding="utf-8", closefd=False)),
-    ],
+    handlers=[_file_handler, _stream_handler],
 )
 log = logging.getLogger("MUESA")
 
