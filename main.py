@@ -42,7 +42,7 @@ SL_PCT               = 0.03
 TP1_PCT              = 0.06
 TP2_PCT              = 0.10
 SCORE_CLAUDE_CALL    = 65
-SCORE_TRADE_EXEC     = 80
+SCORE_TRADE_EXEC     = 75
 SL_COOLDOWN_HOURS    = 24
 BTC_MOVE_3H_PCT      = 0.02          # 2% BTC 3-candle 1H move → direction block
 COIN_MOVE_4H_PCT     = 0.15          # 15% coin move in last 4H candle → skip
@@ -563,6 +563,68 @@ def score_rsi_confirming(closes: list[float], direction: str) -> tuple[float, fl
     return 0.0, rsi, False
 
 # ─────────────────────────────────────────────
+#  SCORING: BOTTOM BOUNCE — up to +20 pts (LONG only)
+# ─────────────────────────────────────────────
+
+def score_bottom_bounce(ohlcv_15m: list) -> tuple[float, bool]:
+    """
+    Awards +20 bonus points for a LONG when ALL 5 conditions are met:
+      1. Price dropped >= 20% in last 48 candles (12h)
+      2. RSI dipped below 30 at some point in last 10 candles (oversold)
+      3. Current price >= 3% above the 10-candle recent low (bounce starting)
+      4. Current candle volume >= 1.5x the 20-candle average (buyers entering)
+      5. EMA7 now > EMA7 three candles ago (turning up)
+
+    Returns (points, bounce_detected).
+      +20, True  — all 5 conditions met
+        0, False — drop < 20% (no check triggered)
+        0, False — drop >= 20% but not all conditions met (no penalty)
+    """
+    if len(ohlcv_15m) < 50:
+        return 0.0, False
+
+    closes  = [c[4] for c in ohlcv_15m]
+    volumes = [c[5] for c in ohlcv_15m]
+
+    # ── Condition 1: >= 20% drop in last 48 candles
+    window_48  = closes[-49:-1]          # 48 closed candles before current
+    high_48    = max(window_48)
+    price_now  = closes[-1]
+    drop_pct   = (high_48 - price_now) / high_48 if high_48 > 0 else 0.0
+    if drop_pct < 0.20:
+        return 0.0, False               # drop < 20% — bottom bounce not triggered
+
+    # ── Condition 2: RSI below 30 at some point in last 10 candles
+    rsi_oversold = False
+    for i in range(len(closes) - 10, len(closes)):
+        if i < RSI_PERIOD:
+            continue
+        r = calc_rsi(closes[:i + 1], RSI_PERIOD)
+        if r < 30:
+            rsi_oversold = True
+            break
+
+    # ── Condition 3: Current price >= 3% above 10-candle low
+    recent_low   = min(closes[-10:])
+    bounce_pct   = (price_now - recent_low) / recent_low if recent_low > 0 else 0.0
+    bouncing     = bounce_pct >= 0.03
+
+    # ── Condition 4: Current volume >= 1.5x 20-candle average
+    avg_vol_20   = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else 0.0
+    cur_vol      = volumes[-1]
+    vol_surge    = avg_vol_20 > 0 and cur_vol >= avg_vol_20 * 1.5
+
+    # ── Condition 5: EMA7 now > EMA7 three candles ago (turning up)
+    ema7_now  = calc_ema(closes,       EMA_SHORT)
+    ema7_prev = calc_ema(closes[:-3],  EMA_SHORT) if len(closes) > 3 else ema7_now
+    ema_turning_up = ema7_now > ema7_prev
+
+    if rsi_oversold and bouncing and vol_surge and ema_turning_up:
+        return 20.0, True
+
+    return 0.0, False   # drop >= 20% but conditions not all met — no penalty
+
+# ─────────────────────────────────────────────
 #  UNIFIED SCORER
 # ─────────────────────────────────────────────
 
@@ -575,14 +637,15 @@ def compute_score(
     btc_ctx: dict,
 ) -> tuple[float, dict, bool]:
     """
-    Score breakdown (max 100 pts):
-      HTF Trend    25 pts  (1W=15, 1D=10)
-      BTC Context  15 pts
-      LTF Align    20 pts  (4H=7, 1H=7, 15m=6)
-      Volume + OI ~20 pts  (vol=10, rvol=10, oi=5)
-      Retest       15 pts  (only when coin moved ≥15% in 4H)
-      Funding       5 pts
-      RSI           5 pts
+    Score breakdown (max 100 pts + up to 20 bonus):
+      HTF Trend      25 pts  (1W=15, 1D=10)
+      BTC Context    15 pts
+      LTF Align      20 pts  (4H=7, 1H=7, 15m=6)
+      Volume + OI   ~20 pts  (vol=10, rvol=10, oi=5)
+      Retest         15 pts  (only when coin moved >=15% in 4H)
+      Funding         5 pts
+      RSI             5 pts
+      Bottom Bounce  +20 bonus (LONG only, all 5 conditions)
     Returns (score, details, blocked).
     """
     details: dict = {"direction": direction, "blocks": []}
@@ -617,6 +680,16 @@ def compute_score(
     if retest_blocked:
         details["blocks"].append("coin_15pct_move_retest_not_confirmed")
         return 0.0, details, True
+
+    # ── Bottom Bounce (LONG only — +20 bonus if all 5 conditions met)
+    bounce_pts = 0.0
+    if direction == "LONG":
+        bounce_pts, bounce_detected = score_bottom_bounce(ohlcv_15m)
+        details["bounce_pts"] = round(bounce_pts, 1)
+        if bounce_detected:
+            details.setdefault("entry_reasons", []).append("Bottom Bounce +20")
+    else:
+        details["bounce_pts"] = 0.0
 
     # ── HTF Trend (1W + 1D)
     htf_pts, htf_blocked = score_htf_trend(ohlcv_by_tf, direction)
@@ -653,8 +726,8 @@ def compute_score(
         details["blocks"].append(f"RSI_extreme_{rsi_val:.1f}")
         return 0.0, details, True
 
-    total = htf_pts + btc_pts + ltf_pts + vol_total + retest_pts + fund_pts + rsi_pts
-    total = max(0.0, min(100.0, total))
+    total = htf_pts + btc_pts + ltf_pts + vol_total + retest_pts + fund_pts + rsi_pts + bounce_pts
+    total = max(0.0, min(120.0, total))   # cap at 120 to allow bounce bonus headroom
 
     details["price"] = round(price_now, 8)
     details["total"] = round(total, 1)
