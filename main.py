@@ -153,6 +153,7 @@ def init_db() -> None:
             retest_pts        REAL DEFAULT 0,
             funding_pts       REAL DEFAULT 0,
             bottom_bounce_pts REAL DEFAULT 0,
+            phase2_pts        REAL DEFAULT 0,
             claude_score      REAL,
             final_score       REAL,
             rationale         TEXT,
@@ -205,6 +206,12 @@ def init_db() -> None:
             FROM coin_scores WHERE blocked=1 AND block_reason NOT IN ('signal_exclusion','open_position','sl_cooldown');
     """)
     conn.commit()
+    # ── Schema migration: add phase2_pts column to existing databases
+    try:
+        conn.execute("ALTER TABLE coin_scores ADD COLUMN phase2_pts REAL DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass   # column already exists — no action needed
     conn.close()
 
 def _db_conn() -> sqlite3.Connection:
@@ -256,8 +263,8 @@ def db_log_coin(scan_id: int, symbol: str, direction: str, details: dict,
         cur  = conn.execute(
             "INSERT INTO coin_scores "
             "(scan_id,symbol,direction,total_score,trend_pts,volume_pts,rsi_pts,oi_pts,"
-            " retest_pts,funding_pts,bottom_bounce_pts,blocked,block_reason,entry_reasons)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " retest_pts,funding_pts,bottom_bounce_pts,phase2_pts,blocked,block_reason,entry_reasons)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 scan_id, symbol, direction,
                 round(float(details.get("total", 0)), 2),
@@ -268,6 +275,7 @@ def db_log_coin(scan_id: int, symbol: str, direction: str, details: dict,
                 round(float(details.get("retest_pts", 0)), 2),
                 round(float(details.get("fund_pts", 0)), 2),
                 round(float(details.get("bounce_pts", 0)), 2),
+                round(float(details.get("phase2_pts", 0)), 2),
                 1 if blocked else 0,
                 block_reason,
                 entry_reasons,
@@ -1156,6 +1164,188 @@ def score_bottom_bounce(ohlcv_15m: list) -> tuple[float, bool]:
     return 0.0, False   # drop >= 20% but conditions not all met — no penalty
 
 # ─────────────────────────────────────────────
+#  PHASE 2: COMBINED PATTERN MODULE — up to +15 pts
+# ─────────────────────────────────────────────
+
+def _detect_candle_pattern(ohlcv: list, direction: str) -> tuple[bool, str]:
+    """
+    Scan the last 3 candles for classic reversal/continuation patterns.
+    LONG  : Hammer, BullishEngulfing, PiercingLine, MorningStar, BullPinbar
+    SHORT : ShootingStar, BearishEngulfing, DarkCloudCover, EveningStar, BearPinbar
+    Returns (found, pattern_name).
+    """
+    if len(ohlcv) < 3:
+        return False, ""
+
+    c1, c2, c3 = ohlcv[-3], ohlcv[-2], ohlcv[-1]   # oldest → newest
+
+    def anatomy(c):
+        o, h, l, cl = float(c[1]), float(c[2]), float(c[3]), float(c[4])
+        total      = h - l if h > l else 1e-9
+        body       = abs(cl - o)
+        upper_wick = h - max(o, cl)
+        lower_wick = min(o, cl) - l
+        return o, h, l, cl, body, total, upper_wick, lower_wick
+
+    o1, h1, l1, c_1, b1, t1, uw1, lw1 = anatomy(c1)
+    o2, h2, l2, c_2, b2, t2, uw2, lw2 = anatomy(c2)
+    o3, h3, l3, c_3, b3, t3, uw3, lw3 = anatomy(c3)
+
+    if direction == "LONG":
+        # Hammer: small body near top, long lower wick >= 2x body, tiny upper wick
+        if b3 <= t3 * 0.35 and lw3 >= b3 * 2.0 and uw3 <= b3 * 0.5 and t3 > 0:
+            return True, "Hammer"
+        # Bullish Engulfing: prev red, curr green body fully engulfs prev body
+        if (c_2 < o2 and c_3 > o3
+                and o3 <= c_2 and c_3 >= o2 and b3 > b2):
+            return True, "BullishEngulfing"
+        # Piercing Line: prev red, curr green opens below prev low, closes > 50% into prev body
+        mid2 = (o2 + c_2) / 2
+        if (c_2 < o2 and c_3 > o3
+                and o3 < l2 and c_3 > mid2 and c_3 < o2):
+            return True, "PiercingLine"
+        # Morning Star: red → small/doji → green recovering > 50% into first candle
+        if (c_1 < o1 and b2 <= t2 * 0.25 and c_3 > o3
+                and c_3 > o1 - (o1 - c_1) * 0.5):
+            return True, "MorningStar"
+        # Bullish Pinbar: lower wick >= 60% of range, close in upper 25%
+        if lw3 >= t3 * 0.60 and c_3 >= h3 - t3 * 0.25:
+            return True, "BullPinbar"
+
+    else:  # SHORT
+        # Shooting Star: small body near bottom, long upper wick >= 2x body
+        if b3 <= t3 * 0.35 and uw3 >= b3 * 2.0 and lw3 <= b3 * 0.5 and t3 > 0:
+            return True, "ShootingStar"
+        # Bearish Engulfing: prev green, curr red body fully engulfs prev body
+        if (c_2 > o2 and c_3 < o3
+                and o3 >= c_2 and c_3 <= o2 and b3 > b2):
+            return True, "BearishEngulfing"
+        # Dark Cloud Cover: prev green, curr red opens above prev high, closes < 50% into prev body
+        mid2 = (o2 + c_2) / 2
+        if (c_2 > o2 and c_3 < o3
+                and o3 > h2 and c_3 < mid2 and c_3 > o2):
+            return True, "DarkCloudCover"
+        # Evening Star: green → small/doji → red recovering > 50% into first candle
+        if (c_1 > o1 and b2 <= t2 * 0.25 and c_3 < o3
+                and c_3 < o1 + (c_1 - o1) * 0.5):
+            return True, "EveningStar"
+        # Bearish Pinbar: upper wick >= 60% of range, close in lower 25%
+        if uw3 >= t3 * 0.60 and c_3 <= l3 + t3 * 0.25:
+            return True, "BearPinbar"
+
+    return False, ""
+
+
+def _detect_market_structure(highs: list, lows: list, direction: str) -> tuple[bool, str]:
+    """
+    Find last 3 pivot highs and lows; check for bullish (HH+HL) or bearish (LH+LL) structure.
+    Uses a symmetric ±3-candle window on all-but-last-3 candles to avoid look-ahead bias.
+    Returns (aligned_with_direction, structure_label).
+    """
+    if len(highs) < 20:
+        return False, "insufficient_data"
+
+    window = 3
+    h = highs[:-window]   # exclude last 3 so pivots can be confirmed symmetrically
+    l = lows[:-window]
+
+    pivot_highs: list[float] = []
+    pivot_lows:  list[float] = []
+
+    for i in range(window, len(h) - window):
+        seg_h = h[i - window : i + window + 1]
+        seg_l = l[i - window : i + window + 1]
+        if h[i] == max(seg_h) and (not pivot_highs or h[i] != pivot_highs[-1]):
+            pivot_highs.append(h[i])
+        if l[i] == min(seg_l) and (not pivot_lows or l[i] != pivot_lows[-1]):
+            pivot_lows.append(l[i])
+
+    if len(pivot_highs) < 2 or len(pivot_lows) < 2:
+        return False, "insufficient_pivots"
+
+    rph = pivot_highs[-min(3, len(pivot_highs)):]   # last up-to-3 pivot highs
+    rpl = pivot_lows[-min(3, len(pivot_lows)):]     # last up-to-3 pivot lows
+
+    hh = all(rph[i] > rph[i - 1] for i in range(1, len(rph)))   # Higher Highs
+    hl = all(rpl[i] > rpl[i - 1] for i in range(1, len(rpl)))   # Higher Lows
+    lh = all(rph[i] < rph[i - 1] for i in range(1, len(rph)))   # Lower Highs
+    ll = all(rpl[i] < rpl[i - 1] for i in range(1, len(rpl)))   # Lower Lows
+
+    if   hh and hl: structure = "HH+HL"
+    elif lh and ll: structure = "LH+LL"
+    else:           structure = "neutral"
+
+    if direction == "LONG":  return (hh and hl), structure
+    else:                    return (lh and ll), structure
+
+
+def _validate_breakout(ohlcv: list, direction: str) -> tuple[bool, float]:
+    """
+    Confirm a directional breakout/breakdown with three sub-conditions:
+      1. Price closed beyond the 10-candle key level (resistance or support).
+      2. Current candle volume >= 1.3x the 20-period average.
+      3. Candle momentum: close in the upper/lower 40% of the candle range.
+    All three must be true. Returns (confirmed, key_level).
+    """
+    if len(ohlcv) < 25:
+        return False, 0.0
+
+    highs   = [float(c[2]) for c in ohlcv]
+    lows    = [float(c[3]) for c in ohlcv]
+    closes  = [float(c[4]) for c in ohlcv]
+    volumes = [float(c[5]) for c in ohlcv]
+
+    cur_h, cur_l, cur_c = highs[-1], lows[-1], closes[-1]
+    cur_range = cur_h - cur_l if cur_h > cur_l else 1e-9
+    avg_vol   = sum(volumes[-21:-1]) / 20
+    vol_surge = avg_vol > 0 and volumes[-1] >= avg_vol * 1.3
+
+    if direction == "LONG":
+        # Resistance: highest high of last 10 fully completed candles
+        key_level = max(highs[-13:-3])
+        broke     = cur_c > key_level
+        momentum  = (cur_c - cur_l) / cur_range >= 0.60    # close in upper 40% of range
+        return (broke and vol_surge and momentum), round(key_level, 8)
+    else:
+        # Support: lowest low of last 10 fully completed candles
+        key_level = min(lows[-13:-3])
+        broke     = cur_c < key_level
+        momentum  = (cur_h - cur_c) / cur_range >= 0.60    # close in lower 40% of range
+        return (broke and vol_surge and momentum), round(key_level, 8)
+
+
+def score_phase2_pattern(ohlcv_15m: list, direction: str) -> tuple[float, bool, str]:
+    """
+    Phase 2 Combined Pattern Module — awards +15 pts only when ALL THREE components agree:
+      Component 1 — Candlestick pattern : reversal / continuation signal aligned with direction.
+      Component 2 — Market structure    : HH+HL series for LONG, LH+LL series for SHORT.
+      Component 3 — Breakout validation : key level broken + volume surge + candle momentum.
+
+    All three must fire simultaneously — no partial credit.
+    Returns (pts, triggered, description).
+    """
+    if len(ohlcv_15m) < 30:
+        return 0.0, False, ""
+
+    highs = [float(c[2]) for c in ohlcv_15m]
+    lows  = [float(c[3]) for c in ohlcv_15m]
+
+    pattern_ok,   pattern_name = _detect_candle_pattern(ohlcv_15m, direction)
+    structure_ok, struct_label = _detect_market_structure(highs, lows, direction)
+    breakout_ok,  key_level    = _validate_breakout(ohlcv_15m, direction)
+
+    log.debug(
+        f"Phase2 [{direction}]: candle={pattern_ok}({pattern_name}) "
+        f"structure={structure_ok}({struct_label}) breakout={breakout_ok}(lvl={key_level})"
+    )
+
+    if pattern_ok and structure_ok and breakout_ok:
+        desc = f"{pattern_name}+{struct_label}+BO@{key_level}"
+        return 15.0, True, desc
+
+    return 0.0, False, ""
+
+# ─────────────────────────────────────────────
 #  UNIFIED SCORER
 # ─────────────────────────────────────────────
 
@@ -1222,6 +1412,12 @@ def compute_score(
     else:
         details["bounce_pts"] = 0.0
 
+    # ── Phase 2: Combined Pattern Module (+15 if candlestick + structure + breakout all agree)
+    phase2_pts, phase2_triggered, phase2_desc = score_phase2_pattern(ohlcv_15m, direction)
+    details["phase2_pts"] = round(phase2_pts, 1)
+    if phase2_triggered:
+        details.setdefault("entry_reasons", []).append(f"Phase2: {phase2_desc}")
+
     # ── HTF Trend (1W + 1D)
     htf_pts, htf_blocked = score_htf_trend(ohlcv_by_tf, direction)
     details["htf_pts"] = round(htf_pts, 1)
@@ -1257,8 +1453,8 @@ def compute_score(
         details["blocks"].append(f"RSI_extreme_{rsi_val:.1f}")
         return 0.0, details, True
 
-    total = htf_pts + btc_pts + ltf_pts + vol_total + retest_pts + fund_pts + rsi_pts + bounce_pts
-    total = max(0.0, min(100.0, total))   # cap at 100 — bounce bonus pushes score up, normalized here
+    total = htf_pts + btc_pts + ltf_pts + vol_total + retest_pts + fund_pts + rsi_pts + bounce_pts + phase2_pts
+    total = max(0.0, min(100.0, total))   # cap at 100 — bonus components push score up, normalized here
 
     details["price"] = round(price_now, 8)
     details["total"] = round(total, 1)
@@ -1274,7 +1470,8 @@ def call_claude(symbol: str, details: dict, direction: str) -> tuple[float, str]
     api_key = os.getenv("ANTHROPIC_API_KEY") or CLAUDE_API_KEY
     client = anthropic.Anthropic(api_key=api_key)
 
-    retest_label = f"CONFIRMED +{details.get('retest_pts', 0)}" if details.get("retest_pts", 0) > 0 else "n/a"
+    retest_label  = f"CONFIRMED +{details.get('retest_pts', 0)}" if details.get("retest_pts", 0) > 0 else "n/a"
+    phase2_label  = f"TRIGGERED +{details.get('phase2_pts', 0)}" if details.get("phase2_pts", 0) > 0 else "n/a"
     prompt = f"""You are MUESA, a professional crypto futures trading AI.
 
 Review this signal for {symbol} on Binance Futures — {direction}.
@@ -1289,6 +1486,7 @@ Score breakdown:
   Retest Detection      : {retest_label} / 15
   Funding Rate          : {details.get('fund_pts', 0)} / 5
   RSI ({details.get('rsi', 'N/A')})              : {details.get('rsi_pts', 0)} / 5
+  Phase 2 Pattern       : {phase2_label} / 15
   Base total            : {details.get('total', 0)} / 100
   Price                 : {details.get('price', 'N/A')}
   Direction             : {direction}
@@ -1384,6 +1582,7 @@ def _build_trade_alert(
         f"Retest      : `{details.get('retest_pts', 0)}` / 15\n"
         f"Funding     : `{details.get('fund_pts', 0)}`\n"
         f"RSI ({details.get('rsi','?')})   : `{details.get('rsi_pts', 0)}`\n"
+        f"Phase2 Ptn  : `{details.get('phase2_pts', 0)}` / 15\n"
         f"─────────────────────\n"
         f"AI Note : _{rationale}_"
     )
@@ -1746,7 +1945,8 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
             f"htf={best_details.get('htf_pts')} ltf={best_details.get('ltf_pts')} "
             f"btc={best_details.get('btc_pts')} vol={best_details.get('vol_pts')} "
             f"rvol={best_details.get('rvol_pts')} retest={best_details.get('retest_pts')} "
-            f"fund={best_details.get('fund_pts')} rsi={best_details.get('rsi_pts')}"
+            f"fund={best_details.get('fund_pts')} rsi={best_details.get('rsi_pts')} "
+            f"phase2={best_details.get('phase2_pts')}"
         )
 
         claude_score, rationale = call_claude(symbol, best_details, best_direction)
