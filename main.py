@@ -1583,7 +1583,8 @@ def sync_open_positions(exchange: ccxt.binanceusdm) -> None:
 # ─────────────────────────────────────────────
 
 def get_top_symbols(exchange: ccxt.binanceusdm) -> list[tuple[str, float]]:
-    """Return [(symbol, vol_24h)] sorted by volume, pre-filtered ≥ 200M.
+    """Return top N [(symbol, vol_24h)] sorted by 24h USDT volume descending.
+    Fetches ALL Binance futures USDT-M perpetuals — no minimum volume filter.
     Binance futures symbols are formatted as BASE/USDT:USDT (perpetuals only).
     """
     try:
@@ -1593,10 +1594,9 @@ def get_top_symbols(exchange: ccxt.binanceusdm) -> list[tuple[str, float]]:
             for sym, t in tickers.items()
             if sym.endswith("/USDT:USDT")   # perpetual futures format
         ]
-        filtered     = [(s, v) for s, v in usdt_pairs if v >= MIN_USDT_VOLUME]
-        sorted_pairs = sorted(filtered, key=lambda x: x[1], reverse=True)
+        sorted_pairs = sorted(usdt_pairs, key=lambda x: x[1], reverse=True)
         result       = sorted_pairs[:TOP_N_COINS]
-        log.info(f"Qualified symbols: {len(result)} (>= ${MIN_USDT_VOLUME/1e6:.0f}M vol)")
+        log.info(f"Top {len(result)} coins by volume fetched (total USDT pairs: {len(usdt_pairs)})")
         return result
     except Exception as e:
         log.error(f"Failed to fetch tickers: {e}")
