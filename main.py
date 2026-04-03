@@ -727,7 +727,7 @@ def compute_score(
         return 0.0, details, True
 
     total = htf_pts + btc_pts + ltf_pts + vol_total + retest_pts + fund_pts + rsi_pts + bounce_pts
-    total = max(0.0, min(120.0, total))   # cap at 120 to allow bounce bonus headroom
+    total = max(0.0, min(100.0, total))   # cap at 100 — bounce bonus pushes score up, normalized here
 
     details["price"] = round(price_now, 8)
     details["total"] = round(total, 1)
