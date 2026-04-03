@@ -32,7 +32,7 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 CLAUDE_MODEL         = "claude-haiku-4-5-20251001"
 SCAN_INTERVAL_MIN    = 5              # scan every 5 min (still uses 15m candle data)
-MIN_USDT_VOLUME      = 200_000_000   # hard skip below 200M
+MIN_USDT_VOLUME      = 200_000_000   # volume scoring tier boundary (NOT a filter)
 HIGH_USDT_VOLUME     = 500_000_000   # tier-1 volume threshold
 TOP_N_COINS          = 100
 MAX_OPEN_POSITIONS   = 1             # hard block if 1 already open
@@ -905,15 +905,18 @@ def score_volume_oi(
     price_prev: float,
 ) -> tuple[float, float, float, float, bool]:
     """
-    Base vol: >500M=+10, 200M-500M=+7, <200M=skip.
+    Base vol: >500M=+10, 200M–500M=+7, <200M=+4.
     RVOL    : >2x=+10, 1.5x=+7, 1.2x=+4, <0.5x=-15.
     OI      : aligned with direction = +5.
-    Returns (vol_pts, rvol_pts, oi_pts, total, skip_coin).
+    No coins are skipped on volume — all top-100 coins are scored.
+    Returns (vol_pts, rvol_pts, oi_pts, total, skip_coin=False always).
     """
-    if vol_24h < MIN_USDT_VOLUME:
-        return 0.0, 0.0, 0.0, 0.0, True
-
-    vol_pts = 10.0 if vol_24h >= HIGH_USDT_VOLUME else 7.0
+    if vol_24h >= HIGH_USDT_VOLUME:
+        vol_pts = 10.0
+    elif vol_24h >= MIN_USDT_VOLUME:
+        vol_pts = 7.0
+    else:
+        vol_pts = 4.0   # low vol but still in top 100 — minor points
 
     rvol_pts = 0.0
     if len(ohlcv_15m) >= 21:
@@ -1154,9 +1157,11 @@ def score_bottom_bounce(ohlcv_15m: list) -> tuple[float, bool]:
     vol_surge    = avg_vol_20 > 0 and cur_vol >= avg_vol_20 * 1.5
 
     # ── Condition 5: EMA7 now > EMA7 three candles ago (turning up)
-    ema7_now  = calc_ema(closes,       EMA_SHORT)
-    ema7_prev = calc_ema(closes[:-3],  EMA_SHORT) if len(closes) > 3 else ema7_now
-    ema_turning_up = ema7_now > ema7_prev
+    ema7_arr  = calc_ema(closes,       EMA_SHORT)
+    ema7_prev_arr = calc_ema(closes[:-3], EMA_SHORT) if len(closes) > 3 else ema7_arr
+    ema7_now_val  = ema7_arr[-1]      if ema7_arr      else 0.0
+    ema7_prev_val = ema7_prev_arr[-1] if ema7_prev_arr else ema7_now_val
+    ema_turning_up = ema7_now_val > ema7_prev_val
 
     if rsi_oversold and bouncing and vol_surge and ema_turning_up:
         return 20.0, True
@@ -1192,45 +1197,47 @@ def _detect_candle_pattern(ohlcv: list, direction: str) -> tuple[bool, str]:
     o3, h3, l3, c_3, b3, t3, uw3, lw3 = anatomy(c3)
 
     if direction == "LONG":
-        # Hammer: small body near top, long lower wick >= 2x body, tiny upper wick
-        if b3 <= t3 * 0.35 and lw3 >= b3 * 2.0 and uw3 <= b3 * 0.5 and t3 > 0:
+        # Hammer: small body, long lower wick >= 2x body AND >= 10% of range, tiny upper wick
+        if (b3 <= t3 * 0.35 and lw3 >= b3 * 2.0 and lw3 >= t3 * 0.10
+                and uw3 <= b3 * 0.5 and t3 > 0):
             return True, "Hammer"
-        # Bullish Engulfing: prev red, curr green body fully engulfs prev body
-        if (c_2 < o2 and c_3 > o3
+        # Bullish Engulfing: prev red, curr green body fully engulfs prev body (both real bodies)
+        if (c_2 < o2 and c_3 > o3 and b2 > 0 and b3 > 0
                 and o3 <= c_2 and c_3 >= o2 and b3 > b2):
             return True, "BullishEngulfing"
         # Piercing Line: prev red, curr green opens below prev low, closes > 50% into prev body
         mid2 = (o2 + c_2) / 2
-        if (c_2 < o2 and c_3 > o3
+        if (c_2 < o2 and c_3 > o3 and b2 > 0 and b3 > 0
                 and o3 < l2 and c_3 > mid2 and c_3 < o2):
             return True, "PiercingLine"
         # Morning Star: red → small/doji → green recovering > 50% into first candle
-        if (c_1 < o1 and b2 <= t2 * 0.25 and c_3 > o3
+        if (c_1 < o1 and b1 > 0 and b2 <= t2 * 0.25 and c_3 > o3 and b3 > 0
                 and c_3 > o1 - (o1 - c_1) * 0.5):
             return True, "MorningStar"
-        # Bullish Pinbar: lower wick >= 60% of range, close in upper 25%
-        if lw3 >= t3 * 0.60 and c_3 >= h3 - t3 * 0.25:
+        # Bullish Pinbar: lower wick >= 60% of range AND > 0, close in upper 25%
+        if lw3 >= t3 * 0.60 and lw3 > 0 and c_3 >= h3 - t3 * 0.25:
             return True, "BullPinbar"
 
     else:  # SHORT
-        # Shooting Star: small body near bottom, long upper wick >= 2x body
-        if b3 <= t3 * 0.35 and uw3 >= b3 * 2.0 and lw3 <= b3 * 0.5 and t3 > 0:
+        # Shooting Star: small body, long upper wick >= 2x body AND >= 10% of range, tiny lower wick
+        if (b3 <= t3 * 0.35 and uw3 >= b3 * 2.0 and uw3 >= t3 * 0.10
+                and lw3 <= b3 * 0.5 and t3 > 0):
             return True, "ShootingStar"
-        # Bearish Engulfing: prev green, curr red body fully engulfs prev body
-        if (c_2 > o2 and c_3 < o3
+        # Bearish Engulfing: prev green, curr red body fully engulfs prev body (both real bodies)
+        if (c_2 > o2 and c_3 < o3 and b2 > 0 and b3 > 0
                 and o3 >= c_2 and c_3 <= o2 and b3 > b2):
             return True, "BearishEngulfing"
         # Dark Cloud Cover: prev green, curr red opens above prev high, closes < 50% into prev body
         mid2 = (o2 + c_2) / 2
-        if (c_2 > o2 and c_3 < o3
+        if (c_2 > o2 and c_3 < o3 and b2 > 0 and b3 > 0
                 and o3 > h2 and c_3 < mid2 and c_3 > o2):
             return True, "DarkCloudCover"
         # Evening Star: green → small/doji → red recovering > 50% into first candle
-        if (c_1 > o1 and b2 <= t2 * 0.25 and c_3 < o3
+        if (c_1 > o1 and b1 > 0 and b2 <= t2 * 0.25 and c_3 < o3 and b3 > 0
                 and c_3 < o1 + (c_1 - o1) * 0.5):
             return True, "EveningStar"
-        # Bearish Pinbar: upper wick >= 60% of range, close in lower 25%
-        if uw3 >= t3 * 0.60 and c_3 <= l3 + t3 * 0.25:
+        # Bearish Pinbar: upper wick >= 60% of range AND > 0, close in lower 25%
+        if uw3 >= t3 * 0.60 and uw3 > 0 and c_3 <= l3 + t3 * 0.25:
             return True, "BearPinbar"
 
     return False, ""
@@ -1358,15 +1365,17 @@ def compute_score(
     btc_ctx: dict,
 ) -> tuple[float, dict, bool]:
     """
-    Score breakdown (max 100 pts + up to 20 bonus):
+    Score breakdown (max 100 pts after cap):
       HTF Trend      25 pts  (1W=15, 1D=10)
       BTC Context    15 pts
       LTF Align      20 pts  (4H=7, 1H=7, 15m=6)
-      Volume + OI   ~20 pts  (vol=10, rvol=10, oi=5)
+      Volume + OI   ~20 pts  (vol=4/7/10, rvol=0–10, oi=5)
       Retest         15 pts  (only when coin moved >=15% in 4H)
       Funding         5 pts
       RSI             5 pts
       Bottom Bounce  +20 bonus (LONG only, all 5 conditions)
+      Phase 2        +15 bonus (all 3 components: candle+structure+breakout)
+    All bonuses are summed then capped at 100.
     Returns (score, details, blocked).
     """
     details: dict = {"direction": direction, "blocks": []}
@@ -1384,12 +1393,13 @@ def compute_score(
         details["blocks"].append(f"BTC_pumped_{BTC_MOVE_3H_PCT*100:.0f}pct_3H")
         return 0.0, details, True
 
-    # ── Volume (<200M = skip coin entirely)
+    # ── Volume & OI scoring (3 tiers: >500M=10, 200M–500M=7, <200M=4; no hard skip)
     vol_pts, rvol_pts, oi_pts, vol_total, skip = score_volume_oi(
         vol_24h, ohlcv_15m, exchange, symbol, direction, price_now, price_prev
     )
+    # skip is always False now — kept for signature compatibility
     if skip:
-        details["blocks"].append("volume<200M")
+        details["blocks"].append("volume_skip")
         return 0.0, details, True
     details["vol_pts"]  = round(vol_pts, 1)
     details["rvol_pts"] = round(rvol_pts, 1)
