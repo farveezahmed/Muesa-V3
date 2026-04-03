@@ -8,6 +8,8 @@ import time
 import math
 import json
 import logging
+import sqlite3
+import threading
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -16,6 +18,7 @@ load_dotenv(override=True)   # override=True ensures .env values win over system
 import ccxt
 import anthropic
 import requests
+from flask import Flask
 
 # ─────────────────────────────────────────────
 #  CONFIGURATION
@@ -28,7 +31,7 @@ TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 CLAUDE_MODEL         = "claude-haiku-4-5-20251001"
-SCAN_INTERVAL_MIN    = 15
+SCAN_INTERVAL_MIN    = 5              # scan every 5 min (still uses 15m candle data)
 MIN_USDT_VOLUME      = 200_000_000   # hard skip below 200M
 HIGH_USDT_VOLUME     = 500_000_000   # tier-1 volume threshold
 TOP_N_COINS          = 100
@@ -47,6 +50,8 @@ SL_COOLDOWN_HOURS    = 24
 BTC_MOVE_3H_PCT      = 0.02          # 2% BTC 3-candle 1H move → direction block
 COIN_MOVE_4H_PCT     = 0.15          # 15% coin move in last 4H candle → skip
 CANDLE_BUFFER_SEC    = 5             # seconds after candle close before scanning
+DASHBOARD_PORT       = 8080          # Flask dashboard port
+DB_PATH              = "muesa.db"    # SQLite database file
 
 # Symbols excluded from signal generation (too liquid / low volatility alpha)
 # BTC context fetching is NOT affected — BTC is still used for market context.
@@ -111,6 +116,295 @@ last_reset_day: int     = -1
 session_trade_count: int = 0
 current_session: str    = ""
 sl_hit_symbols: dict[str, float] = {}   # symbol → unix timestamp of SL hit
+
+# ─────────────────────────────────────────────
+#  DATABASE (SQLite)
+# ─────────────────────────────────────────────
+
+def init_db() -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS scans (
+            id          INTEGER PRIMARY KEY,
+            last_scan   TEXT,
+            next_scan   TEXT,
+            symbols     INTEGER DEFAULT 0,
+            updated_at  TEXT
+        );
+        INSERT OR IGNORE INTO scans (id) VALUES (1);
+
+        CREATE TABLE IF NOT EXISTS signals (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts           TEXT,
+            symbol       TEXT,
+            direction    TEXT,
+            tech_score   REAL,
+            claude_score REAL,
+            final_score  REAL,
+            rationale    TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS trades (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts        TEXT,
+            symbol    TEXT,
+            direction TEXT,
+            entry     REAL,
+            sl        REAL,
+            tp1       REAL,
+            tp2       REAL,
+            qty       REAL,
+            score     REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS blocked (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts        TEXT,
+            symbol    TEXT,
+            direction TEXT,
+            reason    TEXT
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+def db_update_scan(last_scan: str, next_scan: str, symbols: int) -> None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "UPDATE scans SET last_scan=?, next_scan=?, symbols=?, updated_at=? WHERE id=1",
+            (last_scan, next_scan, symbols, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+def db_log_signal(symbol: str, direction: str, tech: float,
+                  claude: float, final: float, rationale: str) -> None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO signals (ts,symbol,direction,tech_score,claude_score,final_score,rationale)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (datetime.now(timezone.utc).isoformat(), symbol, direction, tech, claude, final, rationale),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+def db_log_trade(symbol: str, direction: str, entry: float,
+                 sl: float, tp1: float, tp2: float, qty: float, score: float) -> None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO trades (ts,symbol,direction,entry,sl,tp1,tp2,qty,score)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (datetime.now(timezone.utc).isoformat(), symbol, direction, entry, sl, tp1, tp2, qty, score),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+def db_log_blocked(symbol: str, direction: str, reason: str) -> None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO blocked (ts,symbol,direction,reason) VALUES (?,?,?,?)",
+            (datetime.now(timezone.utc).isoformat(), symbol, direction, reason),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+# ─────────────────────────────────────────────
+#  FLASK DASHBOARD
+# ─────────────────────────────────────────────
+
+_flask_app = Flask(__name__)
+
+def _db_fetch(query: str, params: tuple = ()) -> list:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(query, params).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+@_flask_app.route("/")
+def dashboard() -> str:
+    scan    = (_db_fetch("SELECT * FROM scans WHERE id=1") or [{}])[0]
+    signals = _db_fetch("SELECT * FROM signals ORDER BY id DESC LIMIT 30")
+    trades  = _db_fetch("SELECT * FROM trades  ORDER BY id DESC LIMIT 20")
+    blocked = _db_fetch("SELECT * FROM blocked ORDER BY id DESC LIMIT 50")
+
+    today_utc  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    trade_today = len([t for t in trades if (t.get("ts") or "").startswith(today_utc)])
+
+    def row_color(direction: str) -> str:
+        return "#1a3a1a" if direction == "LONG" else "#3a1a1a"
+
+    def badge(direction: str) -> str:
+        c = "#2ea043" if direction == "LONG" else "#da3633"
+        return f'<span style="background:{c};color:#fff;padding:2px 8px;border-radius:4px;font-size:12px">{direction}</span>'
+
+    def score_color(s) -> str:
+        s = float(s or 0)
+        if s >= 80: return "#2ea043"
+        if s >= 65: return "#d29922"
+        return "#8b949e"
+
+    def fmt_ts(ts: str) -> str:
+        if not ts: return "—"
+        try:    return ts[11:19] + " UTC"
+        except: return ts
+
+    signals_rows = "".join(
+        f'<tr style="background:{row_color(r["direction"])}">'
+        f'<td>{fmt_ts(r["ts"])}</td>'
+        f'<td><b>{r["symbol"]}</b></td>'
+        f'<td>{badge(r["direction"])}</td>'
+        f'<td style="color:{score_color(r["tech_score"])}">{r["tech_score"]}</td>'
+        f'<td style="color:{score_color(r["claude_score"])}">{r["claude_score"]}</td>'
+        f'<td style="color:{score_color(r["final_score"])};font-weight:bold">{r["final_score"]}</td>'
+        f'<td style="color:#8b949e;font-size:12px">{r.get("rationale","")}</td>'
+        f'</tr>'
+        for r in signals
+    ) or '<tr><td colspan="7" style="text-align:center;color:#8b949e">No signals yet</td></tr>'
+
+    trades_rows = "".join(
+        f'<tr style="background:{row_color(r["direction"])}">'
+        f'<td>{fmt_ts(r["ts"])}</td>'
+        f'<td><b>{r["symbol"]}</b></td>'
+        f'<td>{badge(r["direction"])}</td>'
+        f'<td>{r["entry"]}</td>'
+        f'<td style="color:#da3633">{r["sl"]}</td>'
+        f'<td style="color:#2ea043">{r["tp1"]}</td>'
+        f'<td style="color:#2ea043">{r["tp2"]}</td>'
+        f'<td>{r["qty"]}</td>'
+        f'<td style="color:{score_color(r["score"])};font-weight:bold">{r["score"]}</td>'
+        f'</tr>'
+        for r in trades
+    ) or '<tr><td colspan="9" style="text-align:center;color:#8b949e">No trades yet</td></tr>'
+
+    blocked_rows = "".join(
+        f'<tr>'
+        f'<td>{fmt_ts(r["ts"])}</td>'
+        f'<td><b>{r["symbol"]}</b></td>'
+        f'<td>{badge(r["direction"])}</td>'
+        f'<td style="color:#da3633;font-size:12px">{r["reason"]}</td>'
+        f'</tr>'
+        for r in blocked
+    ) or '<tr><td colspan="4" style="text-align:center;color:#8b949e">No blocks recorded</td></tr>'
+
+    html = f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="30">
+<title>MUESA v3.0 Dashboard</title>
+<style>
+  *{{margin:0;padding:0;box-sizing:border-box}}
+  body{{background:#0d1117;color:#c9d1d9;font-family:'Segoe UI',system-ui,monospace;font-size:14px}}
+  h1{{font-size:22px;color:#58a6ff;padding:20px 24px 4px}}
+  .sub{{color:#8b949e;padding:0 24px 16px;font-size:13px}}
+  .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;padding:0 24px 20px}}
+  .card{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px}}
+  .card .label{{color:#8b949e;font-size:12px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}}
+  .card .value{{font-size:24px;font-weight:bold;color:#58a6ff}}
+  .card .value.green{{color:#2ea043}}
+  .card .value.yellow{{color:#d29922}}
+  section{{padding:0 24px 24px}}
+  h2{{font-size:16px;color:#8b949e;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;border-bottom:1px solid #21262d;padding-bottom:6px}}
+  table{{width:100%;border-collapse:collapse;background:#161b22;border-radius:8px;overflow:hidden;border:1px solid #30363d}}
+  th{{background:#21262d;color:#8b949e;font-size:12px;text-transform:uppercase;letter-spacing:1px;padding:8px 12px;text-align:left}}
+  td{{padding:8px 12px;border-bottom:1px solid #21262d;vertical-align:middle}}
+  tr:last-child td{{border-bottom:none}}
+  .status-dot{{width:10px;height:10px;border-radius:50%;background:#2ea043;display:inline-block;margin-right:6px;animation:pulse 2s infinite}}
+  @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.4}}}}
+  .refresh{{float:right;color:#8b949e;font-size:12px;padding:20px 24px 0}}
+</style>
+</head><body>
+<h1>&#9685; MUESA v3.0</h1>
+<div class="sub">Binance Futures | Claude AI | Auto-refresh 30s</div>
+<div class="refresh">Last updated: {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC</div>
+
+<div class="grid">
+  <div class="card">
+    <div class="label">System</div>
+    <div class="value" style="font-size:16px"><span class="status-dot"></span>Running</div>
+  </div>
+  <div class="card">
+    <div class="label">Last Scan</div>
+    <div class="value" style="font-size:16px">{fmt_ts(scan.get("last_scan",""))}</div>
+  </div>
+  <div class="card">
+    <div class="label">Next Scan</div>
+    <div class="value" style="font-size:16px">{fmt_ts(scan.get("next_scan",""))}</div>
+  </div>
+  <div class="card">
+    <div class="label">Symbols Scanned</div>
+    <div class="value">{scan.get("symbols", 0)}</div>
+  </div>
+  <div class="card">
+    <div class="label">Trades Today</div>
+    <div class="value {'green' if trade_today == 0 else 'yellow'}">{trade_today} / {MAX_TRADES_DAY}</div>
+  </div>
+  <div class="card">
+    <div class="label">Open Positions</div>
+    <div class="value">{len(open_positions)} / {MAX_OPEN_POSITIONS}</div>
+  </div>
+  <div class="card">
+    <div class="label">Scan Interval</div>
+    <div class="value" style="font-size:16px">{SCAN_INTERVAL_MIN}m (15m candles)</div>
+  </div>
+  <div class="card">
+    <div class="label">Trade Threshold</div>
+    <div class="value" style="font-size:16px">{SCORE_TRADE_EXEC} / 100</div>
+  </div>
+</div>
+
+<section>
+  <h2>Recent Signals ({len(signals)})</h2>
+  <table>
+    <tr><th>Time</th><th>Symbol</th><th>Dir</th><th>Tech</th><th>Claude</th><th>Final</th><th>Rationale</th></tr>
+    {signals_rows}
+  </table>
+</section>
+
+<section>
+  <h2>Recent Trades ({len(trades)})</h2>
+  <table>
+    <tr><th>Time</th><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP1</th><th>TP2</th><th>Qty</th><th>Score</th></tr>
+    {trades_rows}
+  </table>
+</section>
+
+<section>
+  <h2>Blocked Coins (last 50)</h2>
+  <table>
+    <tr><th>Time</th><th>Symbol</th><th>Dir</th><th>Reason</th></tr>
+    {blocked_rows}
+  </table>
+</section>
+
+</body></html>"""
+    return html
+
+def start_dashboard() -> None:
+    """Start Flask dashboard in a background daemon thread."""
+    import logging as _lg
+    _lg.getLogger("werkzeug").setLevel(_lg.ERROR)  # suppress Flask request logs
+    t = threading.Thread(
+        target=lambda: _flask_app.run(host="0.0.0.0", port=DASHBOARD_PORT, debug=False, use_reloader=False),
+        daemon=True,
+    )
+    t.start()
+    log.info(f"Dashboard running at http://0.0.0.0:{DASHBOARD_PORT}")
 
 # ─────────────────────────────────────────────
 #  TELEGRAM
@@ -913,6 +1207,7 @@ def open_long(
             "sl": sl_price, "tp1": tp1_price, "tp2": tp2_price,
             "order_id": order_id, "opened_at": datetime.now(timezone.utc).isoformat(),
         }
+        db_log_trade(symbol, "LONG", entry_price, sl_price, tp1_price, tp2_price, qty, final_score)
         log.info(f"LONG opened: {symbol} @ {entry_price}  score={final_score}")
         send_telegram(_build_trade_alert(
             "LONG", symbol, entry_price, qty, sl_price, tp1_price, tp2_price,
@@ -978,6 +1273,7 @@ def open_short(
             "sl": sl_price, "tp1": tp1_price, "tp2": tp2_price,
             "order_id": order_id, "opened_at": datetime.now(timezone.utc).isoformat(),
         }
+        db_log_trade(symbol, "SHORT", entry_price, sl_price, tp1_price, tp2_price, qty, final_score)
         log.info(f"SHORT opened: {symbol} @ {entry_price}  score={final_score}")
         send_telegram(_build_trade_alert(
             "SHORT", symbol, entry_price, qty, sl_price, tp1_price, tp2_price,
@@ -1083,6 +1379,8 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
         f"candle closed {candle_close.strftime('%H:%M:%S')} UTC | "
         f"lag +{lag_ms:.0f}ms ==="
     )
+    next_close = next_candle_close_utc()
+    db_update_scan(now.isoformat(), next_close.isoformat(), 0)
 
     # ── Session tracking (resets per-session trade counter)
     session = get_active_session(now) or "Off-Hours"
@@ -1125,6 +1423,7 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
     if not symbol_vols:
         log.warning("No symbols qualified. Skipping scan.")
         return
+    db_update_scan(now.isoformat(), next_close.isoformat(), len(symbol_vols))
 
     candidates: list[tuple[float, str, str, dict]] = []
 
@@ -1150,7 +1449,10 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
             score, details, blocked = compute_score(
                 exchange, symbol, vol_24h, ohlcv_by_tf, direction, btc_ctx
             )
-            if not blocked and score > best_score:
+            if blocked:
+                reason = ", ".join(details.get("blocks", ["unknown"]))
+                db_log_blocked(symbol, direction, reason)
+            elif score > best_score:
                 best_score     = score
                 best_direction = direction
                 best_details   = details
@@ -1174,6 +1476,8 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
             f"{symbol} [{best_direction}] tech={best_score} claude={claude_score} "
             f"final={final_score} | {rationale}"
         )
+
+        db_log_signal(symbol, best_direction, best_score, claude_score, final_score, rationale)
 
         if final_score >= SCORE_TRADE_EXEC:
             candidates.append((final_score, symbol, best_direction, best_details))
@@ -1213,10 +1517,13 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
 
 def main() -> None:
     log.info("MUESA v3.0 starting...")
+    init_db()
+    start_dashboard()
     send_telegram(
         "*MUESA v3.0* started.\n"
         "Sessions: Asia 01-04 | London 07-10 | New York 13-16 UTC\n"
-        "Scanning Binance Futures every 15 minutes."
+        f"Scanning Binance Futures every {SCAN_INTERVAL_MIN} minutes (15m candle data).\n"
+        f"Dashboard: http://139.59.23.165:{DASHBOARD_PORT}"
     )
 
     exchange = create_exchange()
