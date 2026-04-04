@@ -1215,12 +1215,14 @@ def score_volume_oi(
     else:
         vol_pts = 9.0   # low vol but still in top 100 — minor points
 
-    rvol_pts = 0.0
+    rvol_pts   = 0.0
+    rvol_ratio = 0.0
     if len(ohlcv_15m) >= 21:
         volumes = [c[5] for c in ohlcv_15m]
         avg_vol = sum(volumes[-21:-1]) / 20
         if avg_vol > 0:
-            rvol = volumes[-1] / avg_vol
+            rvol       = volumes[-1] / avg_vol
+            rvol_ratio = round(rvol, 3)
             if   rvol >= 2.0: rvol_pts = 10.0
             elif rvol >= 1.5: rvol_pts = 7.0
             elif rvol >= 1.2: rvol_pts = 4.0
@@ -1241,7 +1243,7 @@ def score_volume_oi(
         log.debug(f"OI fetch failed for {symbol}: {e}")
 
     total = vol_pts + rvol_pts + oi_pts
-    return vol_pts, rvol_pts, oi_pts, total, False
+    return vol_pts, rvol_pts, oi_pts, total, False, rvol_ratio
 
 # ─────────────────────────────────────────────
 #  SCORING: MARKET STRUCTURE BONUS — 5 pts
@@ -1783,6 +1785,13 @@ def score_fibonacci_retracement(
     vols      = [float(c[5]) for c in ohlcv_15m]
     avg_vol   = sum(vols[-21:-1]) / 20 if len(vols) >= 21 else 0
     cur_vol   = vols[-1]
+    fib_rvol  = (cur_vol / avg_vol) if avg_vol > 0 else 0.0
+
+    # Block 2: Fibonacci requires minimum RVOL of 0.8 — no volume = no confirmation
+    if fib_rvol < 0.8:
+        log.debug(f"Fibonacci blocked — RVOL={fib_rvol:.2f} < 0.8 minimum")
+        return 0.0, ""
+
     vol_ok    = avg_vol > 0 and cur_vol >= avg_vol * 1.2
 
     # ── 3. EMA confluence — EMA7 or EMA25 (4H) within 2% of fib level
@@ -1955,16 +1964,19 @@ def compute_score(
     price_prev = closes_15m[-2] if len(closes_15m) >= 2 else price_now
 
     # ── Volume & OI scoring (3 tiers: >500M=15, 200M–500M=12, <200M=9; no hard skip)
-    vol_pts, rvol_pts, oi_pts, vol_total, skip = score_volume_oi(
+    vol_pts, rvol_pts, oi_pts, vol_total, skip, rvol_ratio = score_volume_oi(
         vol_24h, ohlcv_15m, exchange, symbol, direction, price_now, price_prev
     )
-    # skip is always False now — kept for signature compatibility
-    if skip:
-        details["blocks"].append("volume_skip")
+    details["vol_pts"]   = round(vol_pts, 1)
+    details["rvol_pts"]  = round(rvol_pts, 1)
+    details["oi_pts"]    = round(oi_pts, 1)
+    details["rvol_ratio"] = rvol_ratio
+
+    # ── Block 1: Zero/Low Volume — RVOL <= 0.3 means no market participation
+    if rvol_ratio <= 0.3:
+        details["blocks"].append(f"Zero Volume Block (RVOL={rvol_ratio:.2f})")
+        log.debug(f"Zero Volume Block [{direction}]: RVOL={rvol_ratio:.3f} <= 0.3")
         return 0.0, details, True
-    details["vol_pts"]  = round(vol_pts, 1)
-    details["rvol_pts"] = round(rvol_pts, 1)
-    details["oi_pts"]   = round(oi_pts, 1)
 
     # ── Retest Detection (15%+ move check — block or bonus)
     retest_pts, retest_blocked = score_retest_detection(ohlcv_4h, ohlcv_15m, direction)
