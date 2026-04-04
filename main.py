@@ -47,14 +47,14 @@ TP2_PCT              = 0.10
 SCORE_CLAUDE_CALL    = 65
 SCORE_TRADE_EXEC     = 75
 SL_COOLDOWN_HOURS    = 24
-BTC_MOVE_3H_PCT      = 0.02          # 2% BTC 3-candle 1H move → direction block
+BTC_CRASH_1H_PCT     = 0.05          # 5% BTC 1H drop → market crash block (all trades)
 COIN_MOVE_4H_PCT     = 0.15          # 15% coin move in last 4H candle → skip
 CANDLE_BUFFER_SEC    = 5             # seconds after candle close before scanning
 DASHBOARD_PORT       = 8080          # Flask dashboard port
 DB_PATH              = "muesa.db"    # SQLite database file
 
 # Symbols excluded from signal generation (too liquid / low volatility alpha)
-# BTC context fetching is NOT affected — BTC is still used for market context.
+# BTC is only used as an emergency crash detector (>5% 1H drop blocks all trades).
 SIGNAL_EXCLUDE = {
     "BTC/USDT:USDT",
     "ETH/USDT:USDT",
@@ -686,7 +686,7 @@ def dashboard() -> str:
   <div class="card">
     <div class="label">Last Scan</div>
     <div class="value" style="font-size:15px">{fmt_ts(scan.get("timestamp",""))}</div>
-    <div class="sub-val">BTC {scan.get("btc_trend","—")} · {scan.get("btc_1h_change",0):+.2f}% 1H</div>
+    <div class="sub-val">BTC 1H: {scan.get("btc_1h_change",0):+.2f}%{" ⚠️ CRASH BLOCK" if scan.get("btc_trend") == "crash" else ""}</div>
   </div>
   <div class="card">
     <div class="label">Next Scan</div>
@@ -888,53 +888,29 @@ def get_active_session(now: datetime) -> str | None:
     return None
 
 # ─────────────────────────────────────────────
-#  STEP 1 — BTC CONTEXT CHECK
+#  STEP 1 — BTC CRASH CHECK
 # ─────────────────────────────────────────────
 
-def get_btc_context(exchange: ccxt.binanceusdm) -> dict:
+def get_btc_crash(exchange: ccxt.binanceusdm) -> dict:
     """
-    Fetch BTC/USDT 1H and 4H data.
+    Emergency crash detector: fetch last 2 closed 1H BTC candles.
     Returns:
-      block_long    : bool  — BTC dropped ≥2% in last 3 1H candles
-      block_short   : bool  — BTC pumped ≥2% in last 3 1H candles
-      trend_4h      : str   — "bullish" | "bearish" | "neutral"
-      change_3h_pct : float — raw BTC 3-candle 1H change %
+      crash         : bool  — BTC dropped ≥5% in last 1H candle
+      change_1h_pct : float — raw 1H % change
     """
-    ctx: dict = {
-        "block_long":    False,
-        "block_short":   False,
-        "trend_4h":      "neutral",
-        "change_3h_pct": 0.0,
-    }
+    ctx: dict = {"crash": False, "change_1h_pct": 0.0}
     try:
-        # ── 3-candle 1H price change (use last 3 fully closed candles)
-        ohlcv_1h = exchange.fetch_ohlcv("BTC/USDT:USDT", "1h", limit=6)
-        if len(ohlcv_1h) >= 4:
-            # [-4:-1] → 3 closed candles, excluding current open
-            closes_3h  = [c[4] for c in ohlcv_1h[-4:-1]]
-            change     = (closes_3h[-1] - closes_3h[0]) / closes_3h[0]
-            ctx["change_3h_pct"] = round(change * 100, 3)
-            if change <= -BTC_MOVE_3H_PCT:
-                ctx["block_long"]  = True
-            elif change >= BTC_MOVE_3H_PCT:
-                ctx["block_short"] = True
-
-        # ── 4H EMA trend
-        ohlcv_4h = exchange.fetch_ohlcv("BTC/USDT:USDT", "4h", limit=CANDLE_LIMIT)
-        if len(ohlcv_4h) >= EMA_MID + 5:
-            closes_4h = [c[4] for c in ohlcv_4h]
-            ema7_arr  = calc_ema(closes_4h, EMA_SHORT)
-            ema25_arr = calc_ema(closes_4h, EMA_MID)
-            if ema7_arr and ema25_arr:
-                diff_pct = (ema7_arr[-1] - ema25_arr[-1]) / ema25_arr[-1]
-                if diff_pct > 0.001:
-                    ctx["trend_4h"] = "bullish"
-                elif diff_pct < -0.001:
-                    ctx["trend_4h"] = "bearish"
-
+        ohlcv_1h = exchange.fetch_ohlcv("BTC/USDT:USDT", "1h", limit=3)
+        if len(ohlcv_1h) >= 2:
+            # [-2] = last fully closed candle
+            prev_close = float(ohlcv_1h[-2][4])
+            last_close = float(ohlcv_1h[-1][4])
+            change = (last_close - prev_close) / prev_close
+            ctx["change_1h_pct"] = round(change * 100, 3)
+            if change <= -BTC_CRASH_1H_PCT:
+                ctx["crash"] = True
     except Exception as e:
-        log.error(f"BTC context fetch failed: {e}")
-
+        log.error(f"BTC crash check failed: {e}")
     return ctx
 
 # ─────────────────────────────────────────────
@@ -996,19 +972,6 @@ def score_htf_trend(ohlcv_by_tf: dict, direction: str) -> tuple[float, bool]:
 #  SCORING: BTC CONTEXT — 15 pts
 # ─────────────────────────────────────────────
 
-def score_btc_context(trend_4h: str, direction: str) -> float:
-    """
-    Aligns → +15 | Neutral → +5 | Opposing → -15
-    """
-    if direction == "LONG":
-        if trend_4h == "bullish": return 15.0
-        if trend_4h == "neutral": return 5.0
-        return -15.0
-    else:  # SHORT
-        if trend_4h == "bearish": return 15.0
-        if trend_4h == "neutral": return 5.0
-        return -15.0
-
 # ─────────────────────────────────────────────
 #  SCORING: LTF ALIGNMENT — 20 pts
 # ─────────────────────────────────────────────
@@ -1048,18 +1011,18 @@ def score_volume_oi(
     price_prev: float,
 ) -> tuple[float, float, float, float, bool]:
     """
-    Base vol: >500M=+10, 200M–500M=+7, <200M=+4.
+    Base vol: >500M=+15, 200M–500M=+12, <200M=+9.
     RVOL    : >2x=+10, 1.5x=+7, 1.2x=+4, <0.5x=-15.
-    OI      : aligned with direction = +5.
+    OI      : aligned with direction = +10.
     No coins are skipped on volume — all top-100 coins are scored.
     Returns (vol_pts, rvol_pts, oi_pts, total, skip_coin=False always).
     """
     if vol_24h >= HIGH_USDT_VOLUME:
-        vol_pts = 10.0
+        vol_pts = 15.0
     elif vol_24h >= MIN_USDT_VOLUME:
-        vol_pts = 7.0
+        vol_pts = 12.0
     else:
-        vol_pts = 4.0   # low vol but still in top 100 — minor points
+        vol_pts = 9.0   # low vol but still in top 100 — minor points
 
     rvol_pts = 0.0
     if len(ohlcv_15m) >= 21:
@@ -1081,13 +1044,30 @@ def score_volume_oi(
             if oi_prev > 0:
                 oi_rising    = oi_now > oi_prev
                 price_rising = price_now > price_prev
-                if direction == "LONG"  and oi_rising and price_rising:     oi_pts = 5.0
-                if direction == "SHORT" and not oi_rising and not price_rising: oi_pts = 5.0
+                if direction == "LONG"  and oi_rising and price_rising:     oi_pts = 10.0
+                if direction == "SHORT" and not oi_rising and not price_rising: oi_pts = 10.0
     except Exception as e:
         log.debug(f"OI fetch failed for {symbol}: {e}")
 
     total = vol_pts + rvol_pts + oi_pts
     return vol_pts, rvol_pts, oi_pts, total, False
+
+# ─────────────────────────────────────────────
+#  SCORING: MARKET STRUCTURE BONUS — 5 pts
+# ─────────────────────────────────────────────
+
+def score_market_structure_bonus(ohlcv_15m: list, direction: str) -> tuple[float, bool]:
+    """
+    Award +5 when market structure aligns: HH+HL for LONG, LH+LL for SHORT.
+    Independent of Phase 2 — standalone check on 15m candles.
+    Returns (points, aligned).
+    """
+    if len(ohlcv_15m) < 20:
+        return 0.0, False
+    highs = [float(c[2]) for c in ohlcv_15m]
+    lows  = [float(c[3]) for c in ohlcv_15m]
+    aligned, _ = _detect_market_structure(highs, lows, direction)
+    return (5.0, True) if aligned else (0.0, False)
 
 # ─────────────────────────────────────────────
 #  SCORING: RETEST DETECTION — 15 pts
@@ -1621,14 +1601,13 @@ def compute_score(
     vol_24h: float,
     ohlcv_by_tf: dict[str, list],
     direction: str,
-    btc_ctx: dict,
 ) -> tuple[float, dict, bool]:
     """
     Score breakdown (max 100 pts after cap):
       HTF Trend      25 pts  (1W=15, 1D=10)
-      BTC Context    15 pts
       LTF Align      20 pts  (4H=7, 1H=7, 15m=6)
-      Volume + OI   ~20 pts  (vol=4/7/10, rvol=0–10, oi=5)
+      Volume + OI   ~25 pts  (vol=9/12/15, rvol=0–10, oi=10)
+      Market Struct   5 pts
       Retest         15 pts  (only when coin moved >=15% in 4H)
       Funding         5 pts
       RSI             5 pts
@@ -1646,12 +1625,7 @@ def compute_score(
     price_now  = closes_15m[-1] if closes_15m else 0.0
     price_prev = closes_15m[-2] if len(closes_15m) >= 2 else price_now
 
-    # ── STEP 1: BTC 3H extreme drop/pump — hard block (SHORT always; LONG deferred until after bounce check)
-    if direction == "SHORT" and btc_ctx.get("block_short"):
-        details["blocks"].append(f"BTC_pumped_{BTC_MOVE_3H_PCT*100:.0f}pct_3H")
-        return 0.0, details, True
-
-    # ── Volume & OI scoring (3 tiers: >500M=10, 200M–500M=7, <200M=4; no hard skip)
+    # ── Volume & OI scoring (3 tiers: >500M=15, 200M–500M=12, <200M=9; no hard skip)
     vol_pts, rvol_pts, oi_pts, vol_total, skip = score_volume_oi(
         vol_24h, ohlcv_15m, exchange, symbol, direction, price_now, price_prev
     )
@@ -1671,7 +1645,7 @@ def compute_score(
         return 0.0, details, True
 
     # ── Bottom Bounce (LONG only — +20 bonus if all 5 conditions met)
-    #    When confirmed: bypasses BTC 3H drop block AND 1D EMA hard block.
+    #    When confirmed: bypasses 1D EMA hard block.
     #    Counter-trend by design — bearish market context is intentionally ignored.
     bounce_pts     = 0.0
     bounce_detected = False
@@ -1680,14 +1654,9 @@ def compute_score(
         details["bounce_pts"] = round(bounce_pts, 1)
         if bounce_detected:
             details.setdefault("entry_reasons", []).append("Bottom Bounce +20")
-            log.info(f"Bottom Bounce confirmed — BTC context block and 1D EMA hard block bypassed for LONG.")
+            log.info(f"Bottom Bounce confirmed — 1D EMA hard block bypassed for LONG.")
     else:
         details["bounce_pts"] = 0.0
-
-    # ── BTC 3H drop block for LONG — bypassed when Bottom Bounce confirmed
-    if direction == "LONG" and btc_ctx.get("block_long") and not bounce_detected:
-        details["blocks"].append(f"BTC_dropped_{BTC_MOVE_3H_PCT*100:.0f}pct_3H")
-        return 0.0, details, True
 
     # ── Phase 2: Combined Pattern Module (+15 if candlestick + structure + breakout all agree)
     phase2_pts, phase2_triggered, phase2_desc = score_phase2_pattern(ohlcv_15m, direction)
@@ -1730,16 +1699,11 @@ def compute_score(
         details["blocks"].append("LTF Weak Alignment")
         return 0.0, details, True
 
-    # ── BTC Context pts (4H EMA alignment vs direction)
-    #    For Bottom Bounce LONGs in bearish market: set to neutral (0) instead of -15 penalty
-    raw_btc_pts = score_btc_context(btc_ctx.get("trend_4h", "neutral"), direction)
-    if direction == "LONG" and bounce_detected and raw_btc_pts < 0:
-        btc_pts = 0.0   # no penalty for counter-trend bottom bounce
-        details.setdefault("entry_reasons", []).append("BTC Penalty Bypassed (Bottom Bounce)")
-    else:
-        btc_pts = raw_btc_pts
-    details["btc_pts"]      = round(btc_pts, 1)
-    details["btc_trend_4h"] = btc_ctx.get("trend_4h", "neutral")
+    # ── Market Structure Bonus (+5 pts when HH+HL or LH+LL confirmed)
+    struct_pts, struct_aligned = score_market_structure_bonus(ohlcv_15m, direction)
+    details["struct_pts"] = round(struct_pts, 1)
+    if struct_aligned:
+        details.setdefault("entry_reasons", []).append("Market Structure Aligned +5")
 
     # ── Funding Rate
     fund_pts, fund_blocked = score_funding(exchange, symbol, direction)
@@ -1756,7 +1720,7 @@ def compute_score(
         details["blocks"].append(f"RSI_extreme_{rsi_val:.1f}")
         return 0.0, details, True
 
-    total = (htf_pts + btc_pts + ltf_pts + vol_total + retest_pts + fund_pts + rsi_pts
+    total = (htf_pts + ltf_pts + vol_total + struct_pts + retest_pts + fund_pts + rsi_pts
              + bounce_pts + phase2_pts + fib_pts + oi_analysis_pts)
     total = max(0.0, min(100.0, total))   # cap at 100 — bonus components push score up, normalized here
 
@@ -1789,11 +1753,11 @@ Review this signal for {symbol} on Binance Futures — {direction}.
 
 Score breakdown:
   HTF Trend (1W+1D)     : {details.get('htf_pts', 0)} / 25
-  BTC 4H Context ({details.get('btc_trend_4h', 'N/A')}) : {details.get('btc_pts', 0)} / 15
   LTF Align ({details.get('ltf_aligned', 0)}/3 TF)      : {details.get('ltf_pts', 0)} / 20
-  Volume                : {details.get('vol_pts', 0)} / 10
+  Volume                : {details.get('vol_pts', 0)} / 15
   RVOL                  : {details.get('rvol_pts', 0)} / 10
-  Open Interest (basic) : {details.get('oi_pts', 0)} / 5
+  Open Interest (basic) : {details.get('oi_pts', 0)} / 10
+  Market Structure      : {details.get('struct_pts', 0)} / 5
   Retest Detection      : {retest_label} / 15
   Funding Rate          : {details.get('fund_pts', 0)} / 5
   RSI ({details.get('rsi', 'N/A')})              : {details.get('rsi_pts', 0)} / 5
@@ -1804,7 +1768,7 @@ Score breakdown:
   Price                 : {details.get('price', 'N/A')}
   Direction             : {direction}
 
-Be conservative. Penalise weak HTF trend, poor LTF alignment, or opposing BTC context.
+Be conservative. Penalise weak HTF trend or poor LTF alignment.
 Return ONLY this JSON (no markdown):
 {{"score": <integer 0-100>, "rationale": "<max 20 words>"}}"""
 
@@ -1888,10 +1852,10 @@ def _build_trade_alert(
         f"─────────────────────\n"
         f"*Score Breakdown ({final_score}/100)*\n"
         f"HTF Trend   : `{details.get('htf_pts', 0)}` / 25\n"
-        f"BTC 4H ({details.get('btc_trend_4h','?')}) : `{details.get('btc_pts', 0)}` / 15\n"
         f"LTF Align   : `{details.get('ltf_pts', 0)}` / 20  ({details.get('ltf_aligned', 0)}/3 TF)\n"
         f"Volume      : `{details.get('vol_pts', 0)}` + RVOL `{details.get('rvol_pts', 0)}`\n"
-        f"OI          : `{details.get('oi_pts', 0)}`\n"
+        f"OI (basic)  : `{details.get('oi_pts', 0)}` / 10\n"
+        f"Mkt Struct  : `{details.get('struct_pts', 0)}` / 5\n"
         f"Retest      : `{details.get('retest_pts', 0)}` / 15\n"
         f"Funding     : `{details.get('fund_pts', 0)}`\n"
         f"RSI ({details.get('rsi','?')})   : `{details.get('rsi_pts', 0)}`\n"
@@ -2214,12 +2178,12 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
 
     sync_open_positions(exchange)
 
-    # ── Create scan record in DB (placeholder — updated at end with totals)
-    btc_prelim = get_btc_context(exchange)  # fetch here so scan_id captures BTC context
+    # ── BTC crash check (emergency block only — >5% 1H drop)
+    btc_crash = get_btc_crash(exchange)
     _current_scan_id = db_create_scan(
         now.isoformat(), next_close.isoformat(),
-        btc_prelim.get("trend_4h", "neutral"),
-        btc_prelim.get("change_3h_pct", 0.0),
+        "crash" if btc_crash["crash"] else "ok",
+        btc_crash.get("change_1h_pct", 0.0),
         session,
     )
 
@@ -2243,13 +2207,14 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
         db_finish_scan(_current_scan_id, 0, 0, 0)
         return
 
-    # ── BTC context (already fetched above for DB — reuse)
-    btc_ctx = btc_prelim
-    log.info(
-        f"BTC context | 3H change: {btc_ctx['change_3h_pct']:+.2f}% | "
-        f"4H trend: {btc_ctx['trend_4h']} | "
-        f"block_long={btc_ctx['block_long']} block_short={btc_ctx['block_short']}"
-    )
+    log.info(f"BTC 1H change: {btc_crash['change_1h_pct']:+.2f}% | crash_block={btc_crash['crash']}")
+    if btc_crash["crash"]:
+        send_telegram(
+            f"⚠️ *Market Crash Detected* — BTC dropped "
+            f"`{btc_crash['change_1h_pct']:.2f}%` in 1H. All trades blocked."
+        )
+        db_finish_scan(_current_scan_id, 0, 0, 0)
+        return
 
     symbol_vols = get_top_symbols(exchange)
     if not symbol_vols:
@@ -2294,7 +2259,7 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
 
         for direction in ("LONG", "SHORT"):
             score, details, blocked = compute_score(
-                exchange, symbol, vol_24h, ohlcv_by_tf, direction, btc_ctx
+                exchange, symbol, vol_24h, ohlcv_by_tf, direction
             )
             block_reason = ", ".join(details.get("blocks", [])) if blocked else ""
             # ── Log EVERY coin/direction to DB regardless of score or block status
@@ -2314,10 +2279,10 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
         log.info(
             f"{symbol} [{best_direction}] score={best_score} >= {SCORE_CLAUDE_CALL} -> calling Claude | "
             f"htf={best_details.get('htf_pts')} ltf={best_details.get('ltf_pts')} "
-            f"btc={best_details.get('btc_pts')} vol={best_details.get('vol_pts')} "
-            f"rvol={best_details.get('rvol_pts')} retest={best_details.get('retest_pts')} "
-            f"fund={best_details.get('fund_pts')} rsi={best_details.get('rsi_pts')} "
-            f"phase2={best_details.get('phase2_pts')} "
+            f"vol={best_details.get('vol_pts')} rvol={best_details.get('rvol_pts')} "
+            f"oi={best_details.get('oi_pts')} struct={best_details.get('struct_pts')} "
+            f"retest={best_details.get('retest_pts')} fund={best_details.get('fund_pts')} "
+            f"rsi={best_details.get('rsi_pts')} phase2={best_details.get('phase2_pts')} "
             f"fib={best_details.get('fib_pts')} oi_analysis={best_details.get('oi_analysis_pts')} | "
             f"patterns=[{', '.join(best_details.get('entry_reasons', []))}]"
         )
