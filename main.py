@@ -1261,6 +1261,76 @@ def score_market_structure_bonus(ohlcv_15m: list, direction: str) -> tuple[float
     return (5.0, True) if aligned else (0.0, False)
 
 # ─────────────────────────────────────────────
+#  ENTRY CANDLE QUALITY CHECK — hard block
+# ─────────────────────────────────────────────
+
+def check_entry_candle_quality(ohlcv_15m: list, direction: str) -> tuple[bool, str]:
+    """
+    Checks the last two fully closed 15m candles for a quality entry setup.
+    Returns (passed, reason_if_failed).
+
+    LONG conditions (all must pass):
+      1. Second-to-last candle is bearish (close < open) — showing pullback
+      2. Last candle is bullish (close > open) — showing bounce
+      3. Last candle body >= 40% of its high-to-low range — strong conviction
+      4. Last candle closes in upper 60% of its range — buyers in control
+
+    SHORT conditions (all must pass):
+      1. Second-to-last candle is bullish (close > open) — showing rise
+      2. Last candle is bearish (close < open) — showing rejection
+      3. Last candle body >= 40% of its high-to-low range — strong conviction
+      4. Last candle closes in lower 60% of its range — sellers in control
+    """
+    if len(ohlcv_15m) < 3:
+        return False, "insufficient candle data"
+
+    # Use last two fully closed candles ([-3] and [-2], [-1] is current open)
+    prev_c = ohlcv_15m[-3]   # second-to-last closed
+    last_c = ohlcv_15m[-2]   # last closed
+
+    prev_open  = float(prev_c[1]); prev_close = float(prev_c[4])
+    last_open  = float(last_c[1]); last_close = float(last_c[4])
+    last_high  = float(last_c[2]); last_low   = float(last_c[3])
+
+    candle_range = last_high - last_low
+    if candle_range <= 0:
+        return False, "zero range candle"
+
+    body_size  = abs(last_close - last_open)
+    body_ratio = body_size / candle_range           # condition 3: >= 0.40
+    close_pos  = (last_close - last_low) / candle_range  # condition 4: position in range
+
+    if direction == "LONG":
+        # Condition 1: prev candle bearish (pullback)
+        if prev_close >= prev_open:
+            return False, "no pullback candle before entry"
+        # Condition 2: last candle bullish (bounce)
+        if last_close <= last_open:
+            return False, "entry candle not bullish"
+        # Condition 3: body strength
+        if body_ratio < 0.40:
+            return False, f"weak body {body_ratio:.0%} < 40%"
+        # Condition 4: close in upper 60% of range
+        if close_pos < 0.40:
+            return False, f"close in lower range ({close_pos:.0%})"
+
+    else:  # SHORT
+        # Condition 1: prev candle bullish (rise)
+        if prev_close <= prev_open:
+            return False, "no rise candle before entry"
+        # Condition 2: last candle bearish (rejection)
+        if last_close >= last_open:
+            return False, "entry candle not bearish"
+        # Condition 3: body strength
+        if body_ratio < 0.40:
+            return False, f"weak body {body_ratio:.0%} < 40%"
+        # Condition 4: close in lower 60% of range
+        if close_pos > 0.60:
+            return False, f"close in upper range ({close_pos:.0%})"
+
+    return True, ""
+
+# ─────────────────────────────────────────────
 #  SCORING: RETEST DETECTION — 15 pts
 # ─────────────────────────────────────────────
 
@@ -1985,6 +2055,13 @@ def compute_score(
 
     details["price"] = round(price_now, 8)
     details["total"] = round(total, 1)
+
+    # ── Entry Candle Quality (final gate — blocks trade if candle structure is weak)
+    candle_ok, candle_fail_reason = check_entry_candle_quality(ohlcv_15m, direction)
+    if not candle_ok:
+        details["blocks"].append(f"Weak Entry Candle: {candle_fail_reason}")
+        log.debug(f"Entry candle quality FAILED [{direction}]: {candle_fail_reason}")
+        return 0.0, details, True
 
     return round(total, 1), details, False
 
