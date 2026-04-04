@@ -36,6 +36,7 @@ MIN_USDT_VOLUME      = 200_000_000   # volume scoring tier boundary (NOT a filte
 HIGH_USDT_VOLUME     = 500_000_000   # tier-1 volume threshold
 TOP_N_COINS          = 100
 MAX_OPEN_POSITIONS   = 1             # hard block if 1 already open
+MAX_WATCHLIST        = 5             # maximum watchlist slots
 WALLET_ALLOC_PCT     = 0.25
 LEVERAGE             = 5
 MARGIN_MODE          = "ISOLATED"
@@ -471,6 +472,42 @@ def db_remove_watchlist(symbol: str) -> None:
     except Exception as e:
         log.debug(f"db_remove_watchlist error: {e}")
 
+def db_get_watchlist_status() -> list[dict]:
+    """Return watchlist coins enriched with last scan score and time."""
+    items = db_get_watchlist()
+    try:
+        conn = _db_conn()
+        for item in items:
+            sym = item["symbol"]
+            row = conn.execute("""
+                SELECT cs.total_score, cs.final_score, cs.direction,
+                       s.timestamp AS scan_time, cs.entry_reasons, cs.block_reason, cs.blocked
+                FROM coin_scores cs
+                LEFT JOIN scans s ON cs.scan_id = s.scan_id
+                WHERE cs.symbol = ?
+                ORDER BY cs.id DESC LIMIT 1
+            """, (sym,)).fetchone()
+            if row:
+                item["last_score"]    = row[0] or 0
+                item["last_final"]    = row[1] or 0
+                item["last_dir"]      = row[2] or "—"
+                item["last_scan"]     = (row[3] or "")[:19].replace("T", " ")
+                item["last_reasons"]  = row[4] or ""
+                item["last_blocked"]  = bool(row[6])
+                item["block_reason"]  = row[5] or ""
+            else:
+                item["last_score"]   = 0
+                item["last_final"]   = 0
+                item["last_dir"]     = "—"
+                item["last_scan"]    = "Not scanned yet"
+                item["last_reasons"] = ""
+                item["last_blocked"] = False
+                item["block_reason"] = ""
+        conn.close()
+    except Exception:
+        pass
+    return items
+
 def db_load_watchlist_symbols() -> set[str]:
     """Return set of watchlist symbol strings."""
     return {r["symbol"] for r in db_get_watchlist()}
@@ -586,7 +623,7 @@ def dashboard() -> str:
         "ORDER BY cs.id DESC LIMIT 50"
     )
     weekly      = (_db_fetch("SELECT * FROM weekly_stats ORDER BY id DESC LIMIT 1") or [{}])[0]
-    watchlist   = db_get_watchlist()
+    watchlist   = db_get_watchlist_status()
     top_coins   = _db_fetch(
         "SELECT symbol, direction, AVG(total_score) AS avg_score, COUNT(*) AS appearances "
         "FROM coin_scores WHERE blocked=0 AND total_score > 0 "
@@ -671,6 +708,70 @@ def dashboard() -> str:
         f'</tr>'
         for r in top_coins
     ) or '<tr><td colspan="4" style="text-align:center;color:#8b949e;padding:20px">Not enough data yet</td></tr>'
+
+    def _wl_status_badge(score: float, blocked: bool, block_reason: str) -> tuple[str, str]:
+        """Return (color, label) for watchlist slot status indicator."""
+        if blocked:
+            return "#8b949e", f"Blocked: {block_reason[:30]}" if block_reason else "Blocked"
+        if score >= SCORE_CLAUDE_CALL:
+            return "#d29922", f"&#9888; Close! Score {score:.0f} — Claude threshold"
+        if score >= 50:
+            return "#58a6ff", f"Building — Score {score:.0f}"
+        if score > 0:
+            return "#8b949e", f"Weak — Score {score:.0f}"
+        return "#8b949e", "Not scanned yet"
+
+    def _wl_slot(wl_items: list, idx: int) -> str:
+        """Render one watchlist slot — filled or empty."""
+        slot_base = "background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px 16px;margin-bottom:10px"
+        if idx < len(wl_items):
+            r      = wl_items[idx]
+            sym    = r["symbol"]
+            score  = float(r.get("last_score") or 0)
+            final  = float(r.get("last_final") or 0)
+            disp_score = final if final > 0 else score
+            s_color, s_label = _wl_status_badge(score, r.get("last_blocked", False), r.get("block_reason",""))
+            reasons = r.get("last_reasons","") or "—"
+            scan_t  = r.get("last_scan","Not scanned yet")
+            dir_badge = badge(r["last_dir"]) if r["last_dir"] not in ("—","") else '<span style="color:#8b949e">—</span>'
+            score_bar_w = min(100, int(disp_score))
+            score_bar_c = "#2ea043" if disp_score >= SCORE_TRADE_EXEC else "#d29922" if disp_score >= SCORE_CLAUDE_CALL else "#58a6ff"
+            return (
+                f'<div style="{slot_base};border-left:3px solid {s_color}">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+                f'  <div style="display:flex;align-items:center;gap:10px">'
+                f'    <span style="font-size:16px;font-weight:bold;color:#58a6ff">Slot {idx+1}</span>'
+                f'    <b style="font-size:15px;color:#c9d1d9">{sym}</b>'
+                f'    {dir_badge}'
+                f'  </div>'
+                f'  <form method="POST" action="/watchlist/remove" style="margin:0">'
+                f'    <input type="hidden" name="symbol" value="{sym}">'
+                f'    <button type="submit" style="background:#3d1010;border:1px solid #da3633;color:#da3633;border-radius:5px;padding:4px 12px;cursor:pointer;font-size:12px">Remove</button>'
+                f'  </form>'
+                f'</div>'
+                f'<div style="background:#0d1117;border-radius:4px;height:6px;margin-bottom:8px">'
+                f'  <div style="background:{score_bar_c};width:{score_bar_w}%;height:6px;border-radius:4px;transition:width .3s"></div>'
+                f'</div>'
+                f'<div style="display:flex;gap:20px;flex-wrap:wrap;font-size:12px;color:#8b949e">'
+                f'  <span>Score: <b style="color:{score_color(disp_score)}">{disp_score:.1f}/100</b></span>'
+                f'  <span>Last scan: <b style="color:#c9d1d9">{scan_t}</b></span>'
+                f'  <span style="color:{s_color}">{s_label}</span>'
+                f'</div>'
+                f'<div style="font-size:11px;color:#8b949e;margin-top:5px">Patterns: {reasons}</div>'
+                f'</div>'
+            )
+        else:
+            return (
+                f'<div style="{slot_base};border-left:3px solid #21262d;opacity:0.7">'
+                f'<div style="display:flex;align-items:center;gap:8px">'
+                f'  <span style="font-size:14px;color:#8b949e">Slot {idx+1} — Empty</span>'
+                f'  <form method="POST" action="/watchlist/add" style="display:flex;gap:6px;margin:0">'
+                f'    <input name="symbol" placeholder="e.g. NOM or SOLUSDT" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:5px 10px;border-radius:5px;font-size:12px;width:180px" />'
+                f'    <button type="submit" style="background:#1f6feb;border:none;color:#fff;border-radius:5px;padding:5px 14px;cursor:pointer;font-size:12px">+ Add</button>'
+                f'  </form>'
+                f'</div>'
+                f'</div>'
+            )
 
     w = weekly
     html = f"""<!DOCTYPE html>
@@ -793,24 +894,8 @@ def dashboard() -> str:
 </section>
 
 <section>
-  <h2>&#11088; Watchlist — Always Scanned</h2>
-  <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
-    <form method="POST" action="/watchlist/add" style="display:flex;gap:8px;align-items:center">
-      <input name="symbol" placeholder="e.g. NOM or SOLUSDT" style="background:#161b22;border:1px solid #30363d;color:#c9d1d9;padding:7px 12px;border-radius:6px;font-size:13px;width:200px" />
-      <button type="submit" class="ctrl-btn" style="background:#1f6feb;color:#fff;border:none;padding:7px 18px">+ Add to Watchlist</button>
-    </form>
-    <span style="color:#8b949e;font-size:12px">Watchlist coins are scanned every cycle regardless of volume ranking</span>
-  </div>
-  {"".join(
-    f'<span style="display:inline-flex;align-items:center;gap:6px;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:5px 10px;margin:4px;font-size:13px">'
-    f'<b style="color:#58a6ff">{r["symbol"]}</b>'
-    f'<span style="color:#8b949e;font-size:11px">added {(r.get("added_at") or "")[:10]}</span>'
-    f'<form method="POST" action="/watchlist/remove" style="display:inline;margin:0">'
-    f'<input type="hidden" name="symbol" value="{r["symbol"]}">'
-    f'<button type="submit" style="background:none;border:none;color:#da3633;cursor:pointer;font-size:13px;padding:0 2px" title="Remove">✕</button>'
-    f'</form></span>'
-    for r in watchlist
-  ) or '<span style="color:#8b949e;font-size:13px">No coins in watchlist yet</span>'}
+  <h2>&#11088; Watchlist — {len(watchlist)}/{MAX_WATCHLIST} Slots Used · Scanned Every {SCAN_INTERVAL_MIN}m</h2>
+  {"".join(_wl_slot(watchlist, i) for i in range(MAX_WATCHLIST))}
 </section>
 
 <div class="two-col">
@@ -869,6 +954,10 @@ def watchlist_add():
         symbol = f"{base}/USDT:USDT"
     else:
         symbol = f"{raw}/USDT:USDT"
+    current = db_get_watchlist()
+    if len(current) >= MAX_WATCHLIST:
+        log.warning(f"Watchlist full ({MAX_WATCHLIST} slots) — cannot add {symbol}")
+        return ("Watchlist full", 400)
     added = db_add_watchlist(symbol)
     if added:
         log.info(f"Watchlist: added {symbol}")
