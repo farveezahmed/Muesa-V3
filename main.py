@@ -36,8 +36,6 @@ MIN_USDT_VOLUME      = 200_000_000   # volume scoring tier boundary (NOT a filte
 HIGH_USDT_VOLUME     = 500_000_000   # tier-1 volume threshold
 TOP_N_COINS          = 100
 MAX_OPEN_POSITIONS   = 1             # hard block if 1 already open
-MAX_TRADES_SESSION   = 1             # max 1 trade per session window
-MAX_TRADES_DAY       = 2             # max 2 trades per calendar day (UTC)
 WALLET_ALLOC_PCT     = 0.25
 LEVERAGE             = 5
 MARGIN_MODE          = "ISOLATED"
@@ -111,9 +109,7 @@ log = logging.getLogger("MUESA")
 # ─────────────────────────────────────────────
 
 open_positions: dict[str, dict] = {}
-daily_trade_count: int   = 0
 last_reset_day: int      = -1
-session_trade_count: int = 0
 current_session: str     = ""
 sl_hit_symbols: dict[str, float] = {}   # symbol → unix timestamp of SL hit
 _current_scan_id: int    = -1           # scan_id of the currently running scan
@@ -700,7 +696,7 @@ def dashboard() -> str:
   </div>
   <div class="card">
     <div class="label">Trades Today</div>
-    <div class="value {'green' if trade_today==0 else 'yellow'}">{trade_today}<span style="font-size:14px;color:#8b949e"> / {MAX_TRADES_DAY}</span></div>
+    <div class="value {'green' if trade_today==0 else 'yellow'}">{trade_today}</div>
     <div class="sub-val">{scan.get("trades_taken",0)} this scan</div>
   </div>
   <div class="card">
@@ -1878,8 +1874,6 @@ def open_long(
     session: str,
 ) -> bool:
     """Returns True if trade was successfully opened."""
-    global daily_trade_count, session_trade_count
-
     qty = get_position_size(exchange, symbol, price)
     if qty <= 0:
         log.warning(f"Invalid qty for {symbol}, skipping.")
@@ -1921,8 +1915,6 @@ def open_long(
             params={"stopPrice": tp2_price, "reduceOnly": True},
         )
 
-        daily_trade_count   += 1
-        session_trade_count += 1
         open_positions[symbol] = {
             "direction": "LONG", "entry": entry_price, "qty": qty,
             "sl": sl_price, "tp1": tp1_price, "tp2": tp2_price,
@@ -1952,8 +1944,6 @@ def open_short(
     session: str,
 ) -> bool:
     """Returns True if trade was successfully opened."""
-    global daily_trade_count, session_trade_count
-
     qty = get_position_size(exchange, symbol, price)
     if qty <= 0:
         log.warning(f"Invalid qty for {symbol}, skipping.")
@@ -1995,8 +1985,6 @@ def open_short(
             params={"stopPrice": tp2_price, "reduceOnly": True},
         )
 
-        daily_trade_count   += 1
-        session_trade_count += 1
         open_positions[symbol] = {
             "direction": "SHORT", "entry": entry_price, "qty": qty,
             "sl": sl_price, "tp1": tp1_price, "tp2": tp2_price,
@@ -2138,11 +2126,10 @@ def get_top_symbols(exchange: ccxt.binanceusdm) -> list[tuple[str, float]]:
 # ─────────────────────────────────────────────
 
 def maybe_reset_daily(now: datetime) -> None:
-    global daily_trade_count, last_reset_day, last_weekly_calc_day
+    global last_reset_day, last_weekly_calc_day
     if now.day != last_reset_day:
-        daily_trade_count = 0
-        last_reset_day    = now.day
-        log.info("Daily trade counter reset.")
+        last_reset_day = now.day
+        log.info("Daily counter reset.")
         # Every Sunday UTC — calculate weekly stats
         if now.weekday() == 6 and now.day != last_weekly_calc_day:
             last_weekly_calc_day = now.day
@@ -2154,7 +2141,7 @@ def maybe_reset_daily(now: datetime) -> None:
 # ─────────────────────────────────────────────
 
 def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
-    global session_trade_count, current_session, _current_scan_id
+    global current_session, _current_scan_id
 
     now    = datetime.now(timezone.utc)
     lag_ms = (now - candle_close).total_seconds() * 1000
@@ -2170,11 +2157,10 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
     # ── Session tracking (resets per-session trade counter)
     session = get_active_session(now) or "Off-Hours"
     if session != current_session:
-        session_trade_count = 0
-        current_session     = session
+        current_session = session
         log.info(f"Session changed: {session}")
 
-    log.info(f"Session: {session} | session trades: {session_trade_count}/{MAX_TRADES_SESSION} | daily: {daily_trade_count}/{MAX_TRADES_DAY}")
+    log.info(f"Session: {session} | open positions: {len(open_positions)}/{MAX_OPEN_POSITIONS}")
 
     sync_open_positions(exchange)
 
@@ -2196,14 +2182,6 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
     # Hard limits — finish scan record before returning so DB row isn't left with 0/0/0
     if len(open_positions) >= MAX_OPEN_POSITIONS:
         log.info(f"Max open positions ({MAX_OPEN_POSITIONS}) reached. Skipping scan.")
-        db_finish_scan(_current_scan_id, 0, 0, 0)
-        return
-    if session_trade_count >= MAX_TRADES_SESSION:
-        log.info(f"{session} session trade limit ({MAX_TRADES_SESSION}) reached. Skipping scan.")
-        db_finish_scan(_current_scan_id, 0, 0, 0)
-        return
-    if daily_trade_count >= MAX_TRADES_DAY:
-        log.info(f"Daily trade limit ({MAX_TRADES_DAY}) reached. Skipping scan.")
         db_finish_scan(_current_scan_id, 0, 0, 0)
         return
 
@@ -2315,10 +2293,6 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
     for final_score, symbol, direction, details, _row_id in candidates[:1]:
         if trading_paused:
             break
-        if session_trade_count >= MAX_TRADES_SESSION:
-            break
-        if daily_trade_count >= MAX_TRADES_DAY:
-            break
         if symbol in open_positions:
             continue
 
@@ -2335,9 +2309,7 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
     db_finish_scan(_current_scan_id, len(symbol_vols), signals_found, trades_taken)
 
     log.info(
-        f"=== Scan complete | open: {len(open_positions)}/{MAX_OPEN_POSITIONS} | "
-        f"session: {session_trade_count}/{MAX_TRADES_SESSION} | "
-        f"daily: {daily_trade_count}/{MAX_TRADES_DAY} ==="
+        f"=== Scan complete | open: {len(open_positions)}/{MAX_OPEN_POSITIONS} ==="
     )
 
 # ─────────────────────────────────────────────
