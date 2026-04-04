@@ -154,6 +154,8 @@ def init_db() -> None:
             funding_pts       REAL DEFAULT 0,
             bottom_bounce_pts REAL DEFAULT 0,
             phase2_pts        REAL DEFAULT 0,
+            fib_pts           REAL DEFAULT 0,
+            oi_analysis_pts   REAL DEFAULT 0,
             claude_score      REAL,
             final_score       REAL,
             rationale         TEXT,
@@ -212,6 +214,16 @@ def init_db() -> None:
         conn.commit()
     except Exception:
         pass   # column already exists — no action needed
+    try:
+        conn.execute("ALTER TABLE coin_scores ADD COLUMN fib_pts REAL DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE coin_scores ADD COLUMN oi_analysis_pts REAL DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass
     conn.close()
 
 def _db_conn() -> sqlite3.Connection:
@@ -263,8 +275,9 @@ def db_log_coin(scan_id: int, symbol: str, direction: str, details: dict,
         cur  = conn.execute(
             "INSERT INTO coin_scores "
             "(scan_id,symbol,direction,total_score,trend_pts,volume_pts,rsi_pts,oi_pts,"
-            " retest_pts,funding_pts,bottom_bounce_pts,phase2_pts,blocked,block_reason,entry_reasons)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " retest_pts,funding_pts,bottom_bounce_pts,phase2_pts,fib_pts,oi_analysis_pts,"
+            " blocked,block_reason,entry_reasons)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 scan_id, symbol, direction,
                 round(float(details.get("total", 0)), 2),
@@ -276,6 +289,8 @@ def db_log_coin(scan_id: int, symbol: str, direction: str, details: dict,
                 round(float(details.get("fund_pts", 0)), 2),
                 round(float(details.get("bounce_pts", 0)), 2),
                 round(float(details.get("phase2_pts", 0)), 2),
+                round(float(details.get("fib_pts", 0)), 2),
+                round(float(details.get("oi_analysis_pts", 0)), 2),
                 1 if blocked else 0,
                 block_reason,
                 entry_reasons,
@@ -1353,6 +1368,122 @@ def score_phase2_pattern(ohlcv_15m: list, direction: str) -> tuple[float, bool, 
     return 0.0, False, ""
 
 # ─────────────────────────────────────────────
+#  PATTERN 1: FIBONACCI RETRACEMENT — up to +20 pts
+# ─────────────────────────────────────────────
+
+def score_fibonacci_retracement(
+    ohlcv_4h: list,
+    price_now: float,
+    direction: str,
+) -> tuple[float, str]:
+    """
+    Uses last 50 four-hour candles to find the swing high and swing low.
+    Calculates retracement levels: 0.382, 0.500, 0.618.
+    Awards points if current 15m price is within 1.5% of any level.
+
+      0.382 or 0.618 → +20 pts  (golden ratio / golden pocket — strongest levels)
+      0.500          → +15 pts  (midpoint — moderate confluence)
+
+    Works identically for LONG (price at support) and SHORT (price at resistance).
+    Returns (pts, label).  label is empty string when no level hit.
+    """
+    if len(ohlcv_4h) < 10 or price_now <= 0:
+        return 0.0, ""
+
+    candles    = ohlcv_4h[-50:] if len(ohlcv_4h) >= 50 else ohlcv_4h
+    swing_high = max(float(c[2]) for c in candles)
+    swing_low  = min(float(c[3]) for c in candles)
+    rng        = swing_high - swing_low
+    if rng <= 0:
+        return 0.0, ""
+
+    fib_382 = swing_low + 0.382 * rng
+    fib_500 = swing_low + 0.500 * rng
+    fib_618 = swing_low + 0.618 * rng
+
+    def within(level: float) -> bool:
+        """Price is within 1.5% of the Fibonacci level."""
+        return abs(price_now - level) / price_now <= 0.015
+
+    if within(fib_382):
+        return 20.0, "Fibonacci 0.382"
+    if within(fib_618):
+        return 20.0, "Fibonacci 0.618"
+    if within(fib_500):
+        return 15.0, "Fibonacci 0.500"
+
+    return 0.0, ""
+
+
+# ─────────────────────────────────────────────
+#  PATTERN 2: OI ANALYSIS — up to +15 pts
+# ─────────────────────────────────────────────
+
+def score_oi_analysis(
+    exchange: ccxt.binanceusdm,
+    symbol: str,
+    direction: str,
+    price_now: float,
+    price_prev: float,
+) -> tuple[float, list]:
+    """
+    Detailed Open Interest analysis — 4 directional conditions + spike bonus.
+
+      LONG  + OI rising  + price rising  → +10  "OI Bullish Confirmation"
+      SHORT + OI rising  + price falling → +10  "OI Bearish Confirmation"
+      LONG  + OI falling + price rising  → +5   "Short Squeeze"
+      SHORT + OI falling + price falling → +5   "Long Liquidation"
+      OI grew >20% over last 4 candles   → +5   "OI Spike Detected"  (stacks)
+
+    The spike bonus stacks on top of whichever directional condition fires.
+    Returns (pts, reasons_list).
+    """
+    pts: float        = 0.0
+    reasons: list     = []
+    try:
+        history = exchange.fetch_open_interest_history(symbol, "15m", limit=6)
+        if not history or len(history) < 2:
+            return 0.0, []
+
+        oi_now  = _oi_value(history[-1])
+        oi_prev = _oi_value(history[-2])
+        if oi_prev <= 0 or oi_now <= 0:
+            return 0.0, []
+
+        oi_rising    = oi_now > oi_prev
+        price_rising = price_now > price_prev
+
+        if direction == "LONG":
+            if oi_rising and price_rising:
+                pts += 10.0
+                reasons.append("OI Bullish Confirmation")
+            elif not oi_rising and price_rising:
+                pts += 5.0
+                reasons.append("Short Squeeze")
+        else:  # SHORT
+            if oi_rising and not price_rising:
+                pts += 10.0
+                reasons.append("OI Bearish Confirmation")
+            elif not oi_rising and not price_rising:
+                pts += 5.0
+                reasons.append("Long Liquidation")
+
+        # OI spike: >20% growth over last 4 completed candles
+        if len(history) >= 5:
+            oi_4ago = _oi_value(history[-5])
+            if oi_4ago > 0:
+                spike_pct = (oi_now - oi_4ago) / oi_4ago
+                if spike_pct > 0.20:
+                    pts += 5.0
+                    reasons.append("OI Spike Detected")
+
+    except Exception as e:
+        log.debug(f"OI analysis failed for {symbol}: {e}")
+
+    return pts, reasons
+
+
+# ─────────────────────────────────────────────
 #  UNIFIED SCORER
 # ─────────────────────────────────────────────
 
@@ -1375,6 +1506,8 @@ def compute_score(
       RSI             5 pts
       Bottom Bounce  +20 bonus (LONG only, all 5 conditions)
       Phase 2        +15 bonus (all 3 components: candle+structure+breakout)
+      Fibonacci      +20/+15 bonus (0.382/0.618=+20, 0.500=+15)
+      OI Analysis    +10/+5 bonus + +5 spike (directional OI confirmation)
     All bonuses are summed then capped at 100.
     Returns (score, details, blocked).
     """
@@ -1428,6 +1561,23 @@ def compute_score(
     if phase2_triggered:
         details.setdefault("entry_reasons", []).append(f"Phase2: {phase2_desc}")
 
+    # ── Fibonacci Retracement (Pattern 1 — up to +20 pts)
+    fib_pts, fib_label = score_fibonacci_retracement(ohlcv_4h, price_now, direction)
+    details["fib_pts"] = round(fib_pts, 1)
+    if fib_label:
+        details.setdefault("entry_reasons", []).append(fib_label)
+        log.debug(f"Fibonacci [{direction}]: {fib_label} +{fib_pts:.0f}pts @ price={price_now}")
+
+    # ── OI Analysis (Pattern 2 — up to +15 pts)
+    oi_analysis_pts, oi_reasons = score_oi_analysis(
+        exchange, symbol, direction, price_now, price_prev
+    )
+    details["oi_analysis_pts"] = round(oi_analysis_pts, 1)
+    for r in oi_reasons:
+        details.setdefault("entry_reasons", []).append(r)
+    if oi_reasons:
+        log.debug(f"OI Analysis [{direction}]: {', '.join(oi_reasons)} +{oi_analysis_pts:.0f}pts")
+
     # ── HTF Trend (1W + 1D)
     htf_pts, htf_blocked = score_htf_trend(ohlcv_by_tf, direction)
     details["htf_pts"] = round(htf_pts, 1)
@@ -1463,7 +1613,8 @@ def compute_score(
         details["blocks"].append(f"RSI_extreme_{rsi_val:.1f}")
         return 0.0, details, True
 
-    total = htf_pts + btc_pts + ltf_pts + vol_total + retest_pts + fund_pts + rsi_pts + bounce_pts + phase2_pts
+    total = (htf_pts + btc_pts + ltf_pts + vol_total + retest_pts + fund_pts + rsi_pts
+             + bounce_pts + phase2_pts + fib_pts + oi_analysis_pts)
     total = max(0.0, min(100.0, total))   # cap at 100 — bonus components push score up, normalized here
 
     details["price"] = round(price_now, 8)
@@ -1480,8 +1631,15 @@ def call_claude(symbol: str, details: dict, direction: str) -> tuple[float, str]
     api_key = os.getenv("ANTHROPIC_API_KEY") or CLAUDE_API_KEY
     client = anthropic.Anthropic(api_key=api_key)
 
-    retest_label  = f"CONFIRMED +{details.get('retest_pts', 0)}" if details.get("retest_pts", 0) > 0 else "n/a"
-    phase2_label  = f"TRIGGERED +{details.get('phase2_pts', 0)}" if details.get("phase2_pts", 0) > 0 else "n/a"
+    retest_label      = f"CONFIRMED +{details.get('retest_pts', 0)}" if details.get("retest_pts", 0) > 0 else "n/a"
+    phase2_label      = f"TRIGGERED +{details.get('phase2_pts', 0)}" if details.get("phase2_pts", 0) > 0 else "n/a"
+    fib_reasons       = [r for r in details.get("entry_reasons", []) if r.startswith("Fibonacci")]
+    fib_label         = f"TRIGGERED {fib_reasons[0]} +{details.get('fib_pts', 0)}" if fib_reasons else "n/a"
+    oi_reasons_list   = [r for r in details.get("entry_reasons", [])
+                         if r in ("OI Bullish Confirmation","OI Bearish Confirmation",
+                                  "Short Squeeze","Long Liquidation","OI Spike Detected")]
+    oi_analysis_label = (f"TRIGGERED {', '.join(oi_reasons_list)} +{details.get('oi_analysis_pts', 0)}"
+                         if oi_reasons_list else "n/a")
     prompt = f"""You are MUESA, a professional crypto futures trading AI.
 
 Review this signal for {symbol} on Binance Futures — {direction}.
@@ -1492,11 +1650,13 @@ Score breakdown:
   LTF Align ({details.get('ltf_aligned', 0)}/3 TF)      : {details.get('ltf_pts', 0)} / 20
   Volume                : {details.get('vol_pts', 0)} / 10
   RVOL                  : {details.get('rvol_pts', 0)} / 10
-  Open Interest         : {details.get('oi_pts', 0)} / 5
+  Open Interest (basic) : {details.get('oi_pts', 0)} / 5
   Retest Detection      : {retest_label} / 15
   Funding Rate          : {details.get('fund_pts', 0)} / 5
   RSI ({details.get('rsi', 'N/A')})              : {details.get('rsi_pts', 0)} / 5
   Phase 2 Pattern       : {phase2_label} / 15
+  Fibonacci Retracement : {fib_label} / 20
+  OI Analysis           : {oi_analysis_label} / 15
   Base total            : {details.get('total', 0)} / 100
   Price                 : {details.get('price', 'N/A')}
   Direction             : {direction}
@@ -1593,6 +1753,10 @@ def _build_trade_alert(
         f"Funding     : `{details.get('fund_pts', 0)}`\n"
         f"RSI ({details.get('rsi','?')})   : `{details.get('rsi_pts', 0)}`\n"
         f"Phase2 Ptn  : `{details.get('phase2_pts', 0)}` / 15\n"
+        f"Fibonacci   : `{details.get('fib_pts', 0)}` / 20\n"
+        f"OI Analysis : `{details.get('oi_analysis_pts', 0)}` / 15\n"
+        f"─────────────────────\n"
+        f"Patterns    : _{', '.join(details.get('entry_reasons', [])) or 'None'}_\n"
         f"─────────────────────\n"
         f"AI Note : _{rationale}_"
     )
@@ -1965,7 +2129,9 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
             f"btc={best_details.get('btc_pts')} vol={best_details.get('vol_pts')} "
             f"rvol={best_details.get('rvol_pts')} retest={best_details.get('retest_pts')} "
             f"fund={best_details.get('fund_pts')} rsi={best_details.get('rsi_pts')} "
-            f"phase2={best_details.get('phase2_pts')}"
+            f"phase2={best_details.get('phase2_pts')} "
+            f"fib={best_details.get('fib_pts')} oi_analysis={best_details.get('oi_analysis_pts')} | "
+            f"patterns=[{', '.join(best_details.get('entry_reasons', []))}]"
         )
 
         claude_score, rationale = call_claude(symbol, best_details, best_direction)
