@@ -119,6 +119,10 @@ sl_hit_symbols: dict[str, float] = {}   # symbol → unix timestamp of SL hit
 _current_scan_id: int    = -1           # scan_id of the currently running scan
 last_weekly_calc_day: int = -1          # track Sunday weekly stats calculation
 
+# ── Bot control state (persisted to DB on change)
+trading_paused: bool  = False   # pause trade execution only (scanning continues)
+scanning_paused: bool = False   # pause scanning entirely (sleep mode)
+
 # ─────────────────────────────────────────────
 #  DATABASE (SQLite) — comprehensive schema v2
 # ─────────────────────────────────────────────
@@ -207,6 +211,14 @@ def init_db() -> None:
             best_coin         TEXT,
             avg_entry_quality REAL DEFAULT 0
         );
+
+        -- ── bot_state: persist pause/resume state across restarts
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
+        INSERT OR IGNORE INTO bot_state (key,value) VALUES ('trading_paused','0');
+        INSERT OR IGNORE INTO bot_state (key,value) VALUES ('scanning_paused','0');
 
         -- ── legacy compat view: keep dashboard queries working
         CREATE VIEW IF NOT EXISTS signals AS
@@ -392,6 +404,36 @@ def db_log_position_check(
         conn.close()
     except Exception as e:
         log.debug(f"db_log_position_check error: {e}")
+
+def db_get_state(key: str) -> str:
+    """Read a bot_state value from DB."""
+    try:
+        conn = _db_conn()
+        row  = conn.execute("SELECT value FROM bot_state WHERE key=?", (key,)).fetchone()
+        conn.close()
+        return row[0] if row else "0"
+    except Exception:
+        return "0"
+
+def db_set_state(key: str, value: str) -> None:
+    """Write a bot_state value to DB."""
+    try:
+        conn = _db_conn()
+        conn.execute("INSERT OR REPLACE INTO bot_state (key,value) VALUES (?,?)", (key, value))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.debug(f"db_set_state error: {e}")
+
+def load_bot_state() -> None:
+    """Load persisted pause states into memory on startup."""
+    global trading_paused, scanning_paused
+    trading_paused  = db_get_state("trading_paused")  == "1"
+    scanning_paused = db_get_state("scanning_paused") == "1"
+    if trading_paused:
+        log.info("Bot state restored: TRADING PAUSED")
+    if scanning_paused:
+        log.info("Bot state restored: SCANNING PAUSED")
 
 def db_calc_weekly_stats() -> None:
     """Calculate weekly stats from the trades table and store in weekly_stats."""
@@ -607,6 +649,12 @@ def dashboard() -> str:
   .status-dot{{width:9px;height:9px;border-radius:50%;background:#2ea043;display:inline-block;margin-right:6px;animation:pulse 2s infinite}}
   @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.4}}}}
   .refresh-bar{{display:flex;justify-content:space-between;align-items:center;padding:0 24px 8px;color:#8b949e;font-size:12px}}
+  .ctrl-bar{{display:flex;gap:12px;align-items:center;padding:0 24px 16px;flex-wrap:wrap}}
+  .ctrl-btn{{border:none;border-radius:6px;padding:8px 20px;font-size:13px;font-weight:bold;cursor:pointer;transition:opacity .15s}}
+  .ctrl-btn:hover{{opacity:.8}}
+  .banner{{margin:0 24px 12px;border-radius:6px;padding:10px 16px;font-weight:bold;font-size:14px;display:flex;align-items:center;gap:8px}}
+  .banner-red{{background:#3d1010;border:1px solid #da3633;color:#da3633}}
+  .banner-green{{background:#0d2818;border:1px solid #2ea043;color:#2ea043}}
 </style>
 </head><body>
 <h1>&#9685; MUESA v3.0</h1>
@@ -614,6 +662,24 @@ def dashboard() -> str:
 <div class="refresh-bar">
   <span><span class="status-dot"></span>Bot running · Scan #{scan.get("scan_id","—")} · Session: {scan.get("session_name","—")}</span>
   <span>Updated: {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC</span>
+</div>
+
+{"<div class='banner banner-red'>&#9888; SCANNING PAUSED — Bot is in sleep mode. No scans or trades.</div>" if scanning_paused else ""}
+{"<div class='banner banner-red'>&#9888; TRADING PAUSED — Scanning active but no new trades will open.</div>" if trading_paused and not scanning_paused else ""}
+{"<div class='banner banner-green'>&#10003; ACTIVE — Scanning and trading running normally.</div>" if not trading_paused and not scanning_paused else ""}
+
+<div class="ctrl-bar">
+  <form method="POST" action="/toggle_trading" style="display:inline">
+    <button class="ctrl-btn" style="background:{'#3d1010;color:#da3633;border:2px solid #da3633' if trading_paused else '#0d2818;color:#2ea043;border:2px solid #2ea043'}">
+      {'&#9646;&#9646; TRADING: PAUSED' if trading_paused else '&#9654; TRADING: ACTIVE'}
+    </button>
+  </form>
+  <form method="POST" action="/toggle_scanning" style="display:inline">
+    <button class="ctrl-btn" style="background:{'#3d1010;color:#da3633;border:2px solid #da3633' if scanning_paused else '#0d2818;color:#2ea043;border:2px solid #2ea043'}">
+      {'&#9646;&#9646; SCANNING: PAUSED' if scanning_paused else '&#9654; SCANNING: ACTIVE'}
+    </button>
+  </form>
+  <span style="color:#8b949e;font-size:12px">Click to toggle · Changes take effect immediately</span>
 </div>
 
 <div class="grid">
@@ -694,6 +760,28 @@ def dashboard() -> str:
 
 </body></html>"""
     return html
+
+@_flask_app.route("/toggle_trading", methods=["POST"])
+def toggle_trading():
+    global trading_paused
+    trading_paused = not trading_paused
+    db_set_state("trading_paused", "1" if trading_paused else "0")
+    state = "PAUSED" if trading_paused else "RESUMED"
+    log.info(f"Trading {state} via dashboard button.")
+    msg = f"*MUESA — Trading {state}*\nScanning continues. {'No new trades will open.' if trading_paused else 'Trade execution is active.'}"
+    send_telegram(msg)
+    return ("", 204)
+
+@_flask_app.route("/toggle_scanning", methods=["POST"])
+def toggle_scanning():
+    global scanning_paused
+    scanning_paused = not scanning_paused
+    db_set_state("scanning_paused", "1" if scanning_paused else "0")
+    state = "PAUSED" if scanning_paused else "RESUMED"
+    log.info(f"Scanning {state} via dashboard button.")
+    msg = f"*MUESA — Scanning {state}*\n{'Bot is in sleep mode. No scans or trades.' if scanning_paused else 'Scanning and trading are active.'}"
+    send_telegram(msg)
+    return ("", 204)
 
 def start_dashboard() -> None:
     """Start Flask dashboard in a background daemon thread."""
@@ -1558,10 +1646,7 @@ def compute_score(
     price_now  = closes_15m[-1] if closes_15m else 0.0
     price_prev = closes_15m[-2] if len(closes_15m) >= 2 else price_now
 
-    # ── STEP 1: BTC direction block — overrides everything
-    if direction == "LONG"  and btc_ctx.get("block_long"):
-        details["blocks"].append(f"BTC_dropped_{BTC_MOVE_3H_PCT*100:.0f}pct_3H")
-        return 0.0, details, True
+    # ── STEP 1: BTC 3H extreme drop/pump — hard block (SHORT always; LONG deferred until after bounce check)
     if direction == "SHORT" and btc_ctx.get("block_short"):
         details["blocks"].append(f"BTC_pumped_{BTC_MOVE_3H_PCT*100:.0f}pct_3H")
         return 0.0, details, True
@@ -1586,14 +1671,23 @@ def compute_score(
         return 0.0, details, True
 
     # ── Bottom Bounce (LONG only — +20 bonus if all 5 conditions met)
-    bounce_pts = 0.0
+    #    When confirmed: bypasses BTC 3H drop block AND 1D EMA hard block.
+    #    Counter-trend by design — bearish market context is intentionally ignored.
+    bounce_pts     = 0.0
+    bounce_detected = False
     if direction == "LONG":
         bounce_pts, bounce_detected = score_bottom_bounce(ohlcv_15m)
         details["bounce_pts"] = round(bounce_pts, 1)
         if bounce_detected:
             details.setdefault("entry_reasons", []).append("Bottom Bounce +20")
+            log.info(f"Bottom Bounce confirmed — BTC context block and 1D EMA hard block bypassed for LONG.")
     else:
         details["bounce_pts"] = 0.0
+
+    # ── BTC 3H drop block for LONG — bypassed when Bottom Bounce confirmed
+    if direction == "LONG" and btc_ctx.get("block_long") and not bounce_detected:
+        details["blocks"].append(f"BTC_dropped_{BTC_MOVE_3H_PCT*100:.0f}pct_3H")
+        return 0.0, details, True
 
     # ── Phase 2: Combined Pattern Module (+15 if candlestick + structure + breakout all agree)
     phase2_pts, phase2_triggered, phase2_desc = score_phase2_pattern(ohlcv_15m, direction)
@@ -1618,12 +1712,15 @@ def compute_score(
     if oi_reasons:
         log.debug(f"OI Analysis [{direction}]: {', '.join(oi_reasons)} +{oi_analysis_pts:.0f}pts")
 
-    # ── HTF Trend (1W + 1D)
+    # ── HTF Trend (1W + 1D) — 1D hard block bypassed when Bottom Bounce confirmed for LONG
     htf_pts, htf_blocked = score_htf_trend(ohlcv_by_tf, direction)
     details["htf_pts"] = round(htf_pts, 1)
     if htf_blocked:
-        details["blocks"].append("1D_strongly_opposing")
-        return 0.0, details, True
+        if direction == "LONG" and bounce_detected:
+            log.info(f"1D EMA hard block bypassed — Bottom Bounce confirmed for LONG.")
+        else:
+            details["blocks"].append("1D_strongly_opposing")
+            return 0.0, details, True
 
     # ── LTF Alignment (4H, 1H, 15m)
     ltf_pts, ltf_aligned, ltf_blocked = score_ltf_alignment(ohlcv_by_tf, direction)
@@ -1633,8 +1730,14 @@ def compute_score(
         details["blocks"].append("LTF Weak Alignment")
         return 0.0, details, True
 
-    # ── BTC Context (4H EMA alignment vs direction)
-    btc_pts = score_btc_context(btc_ctx.get("trend_4h", "neutral"), direction)
+    # ── BTC Context pts (4H EMA alignment vs direction)
+    #    For Bottom Bounce LONGs in bearish market: set to neutral (0) instead of -15 penalty
+    raw_btc_pts = score_btc_context(btc_ctx.get("trend_4h", "neutral"), direction)
+    if direction == "LONG" and bounce_detected and raw_btc_pts < 0:
+        btc_pts = 0.0   # no penalty for counter-trend bottom bounce
+        details.setdefault("entry_reasons", []).append("BTC Penalty Bypassed (Bottom Bounce)")
+    else:
+        btc_pts = raw_btc_pts
     details["btc_pts"]      = round(btc_pts, 1)
     details["btc_trend_4h"] = btc_ctx.get("trend_4h", "neutral")
 
@@ -2241,7 +2344,12 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
     candidates.sort(key=lambda x: x[0], reverse=True)
     trades_taken = 0
 
+    if trading_paused:
+        log.info("Trading is PAUSED — skipping trade execution this scan.")
+
     for final_score, symbol, direction, details, _row_id in candidates[:1]:
+        if trading_paused:
+            break
         if session_trade_count >= MAX_TRADES_SESSION:
             break
         if daily_trade_count >= MAX_TRADES_DAY:
@@ -2274,6 +2382,7 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
 def main() -> None:
     log.info("MUESA v3.0 starting...")
     init_db()
+    load_bot_state()   # restore trading_paused / scanning_paused from DB
     start_dashboard()
     send_telegram(
         "*MUESA v3.0* started.\n"
@@ -2297,6 +2406,12 @@ def main() -> None:
     log.info(f"Position monitor started — checking every {POSITION_CHECK_INTERVAL}s.")
 
     while True:
+        # ── Scanning pause: sleep in 10s ticks so dashboard stays live and state updates apply
+        if scanning_paused:
+            log.info("Scanning is PAUSED — bot in sleep mode. Checking again in 10s.")
+            time.sleep(10)
+            continue
+
         candle_close = next_candle_close_utc()
         wait         = seconds_until_scan()
         log.info(
@@ -2305,6 +2420,9 @@ def main() -> None:
             f"scan starts +{CANDLE_BUFFER_SEC}s after close"
         )
         time.sleep(wait)
+
+        if scanning_paused:
+            continue   # re-check in case paused while sleeping
 
         try:
             run_scan(exchange, candle_close)
