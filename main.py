@@ -216,6 +216,13 @@ def init_db() -> None:
         INSERT OR IGNORE INTO bot_state (key,value) VALUES ('trading_paused','0');
         INSERT OR IGNORE INTO bot_state (key,value) VALUES ('scanning_paused','0');
 
+        -- ── watchlist: user-defined coins always included in every scan
+        CREATE TABLE IF NOT EXISTS watchlist (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol   TEXT UNIQUE NOT NULL,
+            added_at TEXT
+        );
+
         -- ── legacy compat view: keep dashboard queries working
         CREATE VIEW IF NOT EXISTS signals AS
             SELECT id, scan_id, symbol, direction,
@@ -421,6 +428,53 @@ def db_set_state(key: str, value: str) -> None:
     except Exception as e:
         log.debug(f"db_set_state error: {e}")
 
+def db_get_watchlist() -> list[dict]:
+    """Return all watchlist symbols."""
+    try:
+        conn  = _db_conn()
+        rows  = conn.execute("SELECT * FROM watchlist ORDER BY added_at DESC").fetchall()
+        cols  = [d[0] for d in conn.execute("SELECT * FROM watchlist LIMIT 0").description or []]
+        conn.close()
+        return [dict(zip(cols, r)) for r in rows]
+    except Exception:
+        try:
+            conn2 = _db_conn()
+            rows2 = conn2.execute("SELECT id, symbol, added_at FROM watchlist ORDER BY added_at DESC").fetchall()
+            conn2.close()
+            return [{"id": r[0], "symbol": r[1], "added_at": r[2]} for r in rows2]
+        except Exception:
+            return []
+
+def db_add_watchlist(symbol: str) -> bool:
+    """Add a symbol to watchlist. Returns True if added, False if duplicate."""
+    try:
+        conn = _db_conn()
+        conn.execute(
+            "INSERT OR IGNORE INTO watchlist (symbol, added_at) VALUES (?,?)",
+            (symbol, datetime.now(timezone.utc).isoformat()),
+        )
+        changed = conn.execute("SELECT changes()").fetchone()[0]
+        conn.commit()
+        conn.close()
+        return changed > 0
+    except Exception as e:
+        log.debug(f"db_add_watchlist error: {e}")
+        return False
+
+def db_remove_watchlist(symbol: str) -> None:
+    """Remove a symbol from watchlist."""
+    try:
+        conn = _db_conn()
+        conn.execute("DELETE FROM watchlist WHERE symbol=?", (symbol,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.debug(f"db_remove_watchlist error: {e}")
+
+def db_load_watchlist_symbols() -> set[str]:
+    """Return set of watchlist symbol strings."""
+    return {r["symbol"] for r in db_get_watchlist()}
+
 def load_bot_state() -> None:
     """Load persisted pause states into memory on startup."""
     global trading_paused, scanning_paused
@@ -532,6 +586,7 @@ def dashboard() -> str:
         "ORDER BY cs.id DESC LIMIT 50"
     )
     weekly      = (_db_fetch("SELECT * FROM weekly_stats ORDER BY id DESC LIMIT 1") or [{}])[0]
+    watchlist   = db_get_watchlist()
     top_coins   = _db_fetch(
         "SELECT symbol, direction, AVG(total_score) AS avg_score, COUNT(*) AS appearances "
         "FROM coin_scores WHERE blocked=0 AND total_score > 0 "
@@ -737,6 +792,27 @@ def dashboard() -> str:
   </table>
 </section>
 
+<section>
+  <h2>&#11088; Watchlist — Always Scanned</h2>
+  <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+    <form method="POST" action="/watchlist/add" style="display:flex;gap:8px;align-items:center">
+      <input name="symbol" placeholder="e.g. NOM or SOLUSDT" style="background:#161b22;border:1px solid #30363d;color:#c9d1d9;padding:7px 12px;border-radius:6px;font-size:13px;width:200px" />
+      <button type="submit" class="ctrl-btn" style="background:#1f6feb;color:#fff;border:none;padding:7px 18px">+ Add to Watchlist</button>
+    </form>
+    <span style="color:#8b949e;font-size:12px">Watchlist coins are scanned every cycle regardless of volume ranking</span>
+  </div>
+  {"".join(
+    f'<span style="display:inline-flex;align-items:center;gap:6px;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:5px 10px;margin:4px;font-size:13px">'
+    f'<b style="color:#58a6ff">{r["symbol"]}</b>'
+    f'<span style="color:#8b949e;font-size:11px">added {(r.get("added_at") or "")[:10]}</span>'
+    f'<form method="POST" action="/watchlist/remove" style="display:inline;margin:0">'
+    f'<input type="hidden" name="symbol" value="{r["symbol"]}">'
+    f'<button type="submit" style="background:none;border:none;color:#da3633;cursor:pointer;font-size:13px;padding:0 2px" title="Remove">✕</button>'
+    f'</form></span>'
+    for r in watchlist
+  ) or '<span style="color:#8b949e;font-size:13px">No coins in watchlist yet</span>'}
+</section>
+
 <div class="two-col">
   <section style="padding:0">
     <h2>Blocked Coins — Scoring Failures (last 50)</h2>
@@ -777,6 +853,36 @@ def toggle_scanning():
     log.info(f"Scanning {state} via dashboard button.")
     msg = f"*MUESA — Scanning {state}*\n{'Bot is in sleep mode. No scans or trades.' if scanning_paused else 'Scanning and trading are active.'}"
     send_telegram(msg)
+    return ("", 204)
+
+@_flask_app.route("/watchlist/add", methods=["POST"])
+def watchlist_add():
+    from flask import request as _req
+    raw = (_req.form.get("symbol") or "").strip().upper()
+    if not raw:
+        return ("", 204)
+    # Normalise: NOM → NOM/USDT:USDT,  SOLUSDT → SOL/USDT:USDT
+    if raw.endswith("/USDT:USDT"):
+        symbol = raw
+    elif raw.endswith("USDT"):
+        base   = raw[:-4]
+        symbol = f"{base}/USDT:USDT"
+    else:
+        symbol = f"{raw}/USDT:USDT"
+    added = db_add_watchlist(symbol)
+    if added:
+        log.info(f"Watchlist: added {symbol}")
+        send_telegram(f"📋 *Watchlist Updated* — Added `{symbol}`\nWill be included in every scan.")
+    return ("", 204)
+
+@_flask_app.route("/watchlist/remove", methods=["POST"])
+def watchlist_remove():
+    from flask import request as _req
+    symbol = (_req.form.get("symbol") or "").strip()
+    if symbol:
+        db_remove_watchlist(symbol)
+        log.info(f"Watchlist: removed {symbol}")
+        send_telegram(f"📋 *Watchlist Updated* — Removed `{symbol}`")
     return ("", 204)
 
 def start_dashboard() -> None:
@@ -2200,6 +2306,22 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
         db_finish_scan(_current_scan_id, 0, 0, 0)
         return
 
+    # ── Inject watchlist coins (always scanned regardless of volume ranking)
+    watchlist_symbols = db_load_watchlist_symbols()
+    top_symbols_set   = {s for s, _ in symbol_vols}
+    if watchlist_symbols:
+        tickers = {}
+        try:
+            tickers = exchange.fetch_tickers()
+        except Exception:
+            pass
+        for wl_sym in sorted(watchlist_symbols):
+            if wl_sym not in top_symbols_set and wl_sym not in SIGNAL_EXCLUDE:
+                wl_vol = float((tickers.get(wl_sym) or {}).get("quoteVolume") or 0)
+                symbol_vols.append((wl_sym, wl_vol))
+                log.info(f"[WATCHLIST] {wl_sym} injected into scan (vol={wl_vol:,.0f})")
+                send_telegram(f"👁 *Watchlist Scan* — Monitoring `{wl_sym}` this cycle.")
+
     candidates: list[tuple[float, str, str, dict, int]] = []  # (score, sym, dir, details, coin_row_id)
     signals_found = 0
 
@@ -2298,6 +2420,15 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
 
         price     = details.get("price", 0.0)
         rationale = details.get("_rationale", f"{direction} score {final_score}/100")
+
+        is_watchlist = symbol in watchlist_symbols
+        if is_watchlist:
+            send_telegram(
+                f"⭐ *Watchlist Trade Triggered!*\n"
+                f"`{symbol}` [{direction}] scored `{final_score}/100`\n"
+                f"Reasons: {', '.join(details.get('entry_reasons', [])) or 'N/A'}\n"
+                f"Claude: _{rationale}_"
+            )
 
         if direction == "LONG":
             if open_long(exchange, symbol, price, details, rationale, final_score, session):
