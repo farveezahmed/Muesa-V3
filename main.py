@@ -1672,23 +1672,29 @@ def score_phase2_pattern(ohlcv_15m: list, direction: str) -> tuple[float, bool, 
 
 def score_fibonacci_retracement(
     ohlcv_4h: list,
+    ohlcv_15m: list,
     price_now: float,
     direction: str,
 ) -> tuple[float, str]:
     """
-    Uses last 50 four-hour candles to find the swing high and swing low.
-    Calculates retracement levels: 0.382, 0.500, 0.618.
-    Awards points if current 15m price is within 1.5% of any level.
+    Professional Fibonacci confirmation — ALL 5 conditions must pass to award +20 pts:
 
-      0.382 or 0.618 → +20 pts  (golden ratio / golden pocket — strongest levels)
-      0.500          → +15 pts  (midpoint — moderate confluence)
+      1. Price within 1.5% of a key fib level (0.382, 0.500, 0.618, 0.786)
+         from 4H swing high/low over last 50 candles.
+      2. Volume on current 15m candle > 1.2x 20-candle average (reaction at level).
+      3. EMA7 or EMA25 (4H) within 2% of the fib level (structural confluence).
+      4. RSI (15m) in healthy zone — not extreme (25–75 range, 40–70 for LONG, 30–60 for SHORT).
+      5. Price has bounced ≥0.5% from the fib level (not just touching it):
+           LONG  — candle wick low touched level and close is 0.5%+ above it.
+           SHORT — candle wick high touched level and close is 0.5%+ below it.
 
-    Works identically for LONG (price at support) and SHORT (price at resistance).
-    Returns (pts, label).  label is empty string when no level hit.
+    Label format: "Fibonacci 0.618 + Volume + EMA Confluence"
+    Returns (pts, label). Returns (0, "") if any condition fails.
     """
-    if len(ohlcv_4h) < 10 or price_now <= 0:
+    if len(ohlcv_4h) < 10 or len(ohlcv_15m) < 22 or price_now <= 0:
         return 0.0, ""
 
+    # ── 1. Calculate fib levels from 4H swing high/low
     candles    = ohlcv_4h[-50:] if len(ohlcv_4h) >= 50 else ohlcv_4h
     swing_high = max(float(c[2]) for c in candles)
     swing_low  = min(float(c[3]) for c in candles)
@@ -1696,20 +1702,82 @@ def score_fibonacci_retracement(
     if rng <= 0:
         return 0.0, ""
 
-    fib_382 = swing_low + 0.382 * rng
-    fib_500 = swing_low + 0.500 * rng
-    fib_618 = swing_low + 0.618 * rng
+    levels = {
+        "0.382": swing_low + 0.382 * rng,
+        "0.500": swing_low + 0.500 * rng,
+        "0.618": swing_low + 0.618 * rng,
+        "0.786": swing_low + 0.786 * rng,
+    }
 
-    def within(level: float) -> bool:
-        """Price is within 1.5% of the Fibonacci level."""
-        return abs(price_now - level) / price_now <= 0.015
+    # ── 2. Volume check — current 15m candle vs 20-candle average
+    vols      = [float(c[5]) for c in ohlcv_15m]
+    avg_vol   = sum(vols[-21:-1]) / 20 if len(vols) >= 21 else 0
+    cur_vol   = vols[-1]
+    vol_ok    = avg_vol > 0 and cur_vol >= avg_vol * 1.2
 
-    if within(fib_382):
-        return 20.0, "Fibonacci 0.382"
-    if within(fib_618):
-        return 20.0, "Fibonacci 0.618"
-    if within(fib_500):
-        return 15.0, "Fibonacci 0.500"
+    # ── 3. EMA confluence — EMA7 or EMA25 (4H) within 2% of fib level
+    closes_4h = [float(c[4]) for c in ohlcv_4h]
+    ema7_4h   = calc_ema(closes_4h, 7)
+    ema25_4h  = calc_ema(closes_4h, 25)
+    ema7_val  = ema7_4h[-1]  if ema7_4h  else 0.0
+    ema25_val = ema25_4h[-1] if ema25_4h else 0.0
+
+    # ── 4. RSI check — healthy zone, not extreme
+    closes_15m = [float(c[4]) for c in ohlcv_15m]
+    rsi_val    = calc_rsi(closes_15m)
+    if direction == "LONG":
+        rsi_ok = 40 <= rsi_val <= 70   # not overbought, has room to run
+    else:
+        rsi_ok = 30 <= rsi_val <= 60   # not oversold, has room to fall
+
+    # ── 5. Bounce check using last 15m candle wick
+    last_c    = ohlcv_15m[-1]
+    last_low  = float(last_c[3])
+    last_high = float(last_c[2])
+
+    # ── Evaluate each level
+    for label, level in levels.items():
+        if level <= 0:
+            continue
+
+        # Condition 1 — proximity (wick touch within 1.5%)
+        if direction == "LONG":
+            level_touched = abs(last_low - level) / level <= 0.015
+            bounced       = price_now >= level * 1.005   # 0.5% above level
+        else:
+            level_touched = abs(last_high - level) / level <= 0.015
+            bounced       = price_now <= level * 0.995   # 0.5% below level
+
+        if not level_touched or not bounced:
+            continue
+
+        # Condition 3 — EMA confluence
+        ema_near = (
+            (ema7_val  > 0 and abs(ema7_val  - level) / level <= 0.02) or
+            (ema25_val > 0 and abs(ema25_val - level) / level <= 0.02)
+        )
+
+        # Build confirmation list
+        confirmations = []
+        if vol_ok:   confirmations.append("Volume")
+        if ema_near: confirmations.append("EMA Confluence")
+        if rsi_ok:   confirmations.append("RSI Healthy")
+
+        # All 5 conditions must pass
+        if vol_ok and ema_near and rsi_ok:
+            conf_str  = " + ".join(confirmations)
+            full_label = f"Fibonacci {label} + {conf_str}"
+            log.debug(
+                f"Fib {label} [{direction}]: level={level:.6f} price={price_now:.6f} "
+                f"vol={cur_vol:.0f}/{avg_vol:.0f} ema7={ema7_val:.4f} ema25={ema25_val:.4f} rsi={rsi_val:.1f}"
+            )
+            return 20.0, full_label
+
+        # Partial log — conditions not all met
+        log.debug(
+            f"Fib {label} [{direction}] NEAR but unconfirmed: "
+            f"vol={vol_ok} ema={ema_near} rsi={rsi_ok}({rsi_val:.1f}) bounce={bounced}"
+        )
 
     return 0.0, ""
 
@@ -1855,8 +1923,8 @@ def compute_score(
     if phase2_triggered:
         details.setdefault("entry_reasons", []).append(f"Phase2: {phase2_desc}")
 
-    # ── Fibonacci Retracement (Pattern 1 — up to +20 pts)
-    fib_pts, fib_label = score_fibonacci_retracement(ohlcv_4h, price_now, direction)
+    # ── Fibonacci Retracement (Pattern 1 — up to +20 pts, all 5 conditions required)
+    fib_pts, fib_label = score_fibonacci_retracement(ohlcv_4h, ohlcv_15m, price_now, direction)
     details["fib_pts"] = round(fib_pts, 1)
     if fib_label:
         details.setdefault("entry_reasons", []).append(fib_label)
@@ -1953,7 +2021,7 @@ Score breakdown:
   Funding Rate          : {details.get('fund_pts', 0)} / 5
   RSI ({details.get('rsi', 'N/A')})              : {details.get('rsi_pts', 0)} / 5
   Phase 2 Pattern       : {phase2_label} / 15
-  Fibonacci Retracement : {fib_label} / 20
+  Fibonacci (confirmed) : {fib_label} / 20
   OI Analysis           : {oi_analysis_label} / 15
   Base total            : {details.get('total', 0)} / 100
   Price                 : {details.get('price', 'N/A')}
@@ -2051,7 +2119,7 @@ def _build_trade_alert(
         f"Funding     : `{details.get('fund_pts', 0)}`\n"
         f"RSI ({details.get('rsi','?')})   : `{details.get('rsi_pts', 0)}`\n"
         f"Phase2 Ptn  : `{details.get('phase2_pts', 0)}` / 15\n"
-        f"Fibonacci   : `{details.get('fib_pts', 0)}` / 20\n"
+        f"Fibonacci   : `{details.get('fib_pts', 0)}` / 20 (all 5 conditions)\n"
         f"OI Analysis : `{details.get('oi_analysis_pts', 0)}` / 15\n"
         f"─────────────────────\n"
         f"Patterns    : _{', '.join(details.get('entry_reasons', [])) or 'None'}_\n"
