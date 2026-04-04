@@ -1620,7 +1620,7 @@ def open_long(
 
     try:
         set_leverage_and_margin(exchange, symbol)
-        # One-Way Mode: no positionSide parameter on any order
+        # One-Way Mode — no positionSide in params (account is not Hedge Mode)
         order = exchange.create_order(
             symbol=symbol, type="market", side="buy", amount=qty,
         )
@@ -1694,7 +1694,7 @@ def open_short(
 
     try:
         set_leverage_and_margin(exchange, symbol)
-        # One-Way Mode: no positionSide parameter on any order
+        # One-Way Mode — no positionSide in params (account is not Hedge Mode)
         order = exchange.create_order(
             symbol=symbol, type="market", side="sell", amount=qty,
         )
