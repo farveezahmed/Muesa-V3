@@ -1620,31 +1620,34 @@ def open_long(
 
     try:
         set_leverage_and_margin(exchange, symbol)
+        # One-Way Mode: no positionSide parameter on any order
         order = exchange.create_order(
             symbol=symbol, type="market", side="buy", amount=qty,
-            params={"positionSide": "LONG"},
         )
         entry_price = float(order.get("average") or price)
         order_id    = order.get("id", "N/A")
 
-        # Recalculate SL/TP from actual fill
+        # Recalculate SL/TP from actual fill price
         sl_price  = round(entry_price * (1 - SL_PCT), 8)
         tp1_price = round(entry_price * (1 + TP1_PCT), 8)
         tp2_price = round(entry_price * (1 + TP2_PCT), 8)
 
+        # SL: closePosition closes entire position without specifying amount
         exchange.create_order(
             symbol=symbol, type="stop_market", side="sell", amount=qty,
-            params={"stopPrice": sl_price, "closePosition": True, "positionSide": "LONG"},
+            params={"stopPrice": sl_price, "closePosition": True},
         )
+        # TP1: half position — reduceOnly ensures it only reduces, never flips
         exchange.create_order(
             symbol=symbol, type="take_profit_market", side="sell",
             amount=round(qty / 2, 6),
-            params={"stopPrice": tp1_price, "positionSide": "LONG"},
+            params={"stopPrice": tp1_price, "reduceOnly": True},
         )
+        # TP2: remaining half
         exchange.create_order(
             symbol=symbol, type="take_profit_market", side="sell",
             amount=round(qty / 2, 6),
-            params={"stopPrice": tp2_price, "positionSide": "LONG"},
+            params={"stopPrice": tp2_price, "reduceOnly": True},
         )
 
         daily_trade_count   += 1
@@ -1691,31 +1694,34 @@ def open_short(
 
     try:
         set_leverage_and_margin(exchange, symbol)
+        # One-Way Mode: no positionSide parameter on any order
         order = exchange.create_order(
             symbol=symbol, type="market", side="sell", amount=qty,
-            params={"positionSide": "SHORT"},
         )
         entry_price = float(order.get("average") or price)
         order_id    = order.get("id", "N/A")
 
-        # Recalculate SL/TP from actual fill
+        # Recalculate SL/TP from actual fill price
         sl_price  = round(entry_price * (1 + SL_PCT), 8)
         tp1_price = round(entry_price * (1 - TP1_PCT), 8)
         tp2_price = round(entry_price * (1 - TP2_PCT), 8)
 
+        # SL: closePosition closes entire position without specifying amount
         exchange.create_order(
             symbol=symbol, type="stop_market", side="buy", amount=qty,
-            params={"stopPrice": sl_price, "closePosition": True, "positionSide": "SHORT"},
+            params={"stopPrice": sl_price, "closePosition": True},
         )
+        # TP1: half position — reduceOnly ensures it only reduces, never flips
         exchange.create_order(
             symbol=symbol, type="take_profit_market", side="buy",
             amount=round(qty / 2, 6),
-            params={"stopPrice": tp1_price, "positionSide": "SHORT"},
+            params={"stopPrice": tp1_price, "reduceOnly": True},
         )
+        # TP2: remaining half
         exchange.create_order(
             symbol=symbol, type="take_profit_market", side="buy",
             amount=round(qty / 2, 6),
-            params={"stopPrice": tp2_price, "positionSide": "SHORT"},
+            params={"stopPrice": tp2_price, "reduceOnly": True},
         )
 
         daily_trade_count   += 1
