@@ -181,6 +181,19 @@ def init_db() -> None:
             status        TEXT DEFAULT 'open'
         );
 
+        -- ── position_checks: every 10s snapshot of each open position
+        CREATE TABLE IF NOT EXISTS position_checks (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp     TEXT,
+            symbol        TEXT,
+            direction     TEXT,
+            entry_price   REAL,
+            current_price REAL,
+            pnl_pct       REAL,
+            pnl_usdt      REAL,
+            position_size REAL
+        );
+
         -- ── weekly_stats: auto-calculated every Sunday UTC
         CREATE TABLE IF NOT EXISTS weekly_stats (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -352,6 +365,33 @@ def db_update_trade_status(symbol: str, status: str) -> None:
         conn.close()
     except Exception as e:
         log.debug(f"db_update_trade_status error: {e}")
+
+def db_log_position_check(
+    symbol: str, direction: str, entry_price: float,
+    current_price: float, pnl_pct: float, pnl_usdt: float,
+    position_size: float,
+) -> None:
+    """Log a 10-second position snapshot to position_checks table."""
+    try:
+        conn = _db_conn()
+        conn.execute(
+            "INSERT INTO position_checks "
+            "(timestamp,symbol,direction,entry_price,current_price,pnl_pct,pnl_usdt,position_size)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                symbol, direction,
+                round(entry_price, 8),
+                round(current_price, 8),
+                round(pnl_pct, 4),
+                round(pnl_usdt, 4),
+                round(position_size, 6),
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.debug(f"db_log_position_check error: {e}")
 
 def db_calc_weekly_stats() -> None:
     """Calculate weekly stats from the trades table and store in weekly_stats."""
@@ -901,7 +941,7 @@ def score_ltf_alignment(ohlcv_by_tf: dict, direction: str) -> tuple[float, int, 
             points += pts
             aligned_count += 1
 
-    return points, aligned_count, aligned_count < 2
+    return points, aligned_count, aligned_count < 3
 
 # ─────────────────────────────────────────────
 #  SCORING: VOLUME & OI — ~20 pts
@@ -1590,7 +1630,7 @@ def compute_score(
     details["ltf_pts"]     = round(ltf_pts, 1)
     details["ltf_aligned"] = ltf_aligned
     if ltf_blocked:
-        details["blocks"].append(f"only_{ltf_aligned}_LTF_aligned")
+        details["blocks"].append("LTF Weak Alignment")
         return 0.0, details, True
 
     # ── BTC Context (4H EMA alignment vs direction)
@@ -1913,6 +1953,51 @@ def open_short(
 #  POSITION MONITOR
 # ─────────────────────────────────────────────
 
+POSITION_CHECK_INTERVAL = 10   # seconds between position snapshots
+
+def _log_position_snapshots(exchange: ccxt.binanceusdm) -> None:
+    """
+    For every open position: fetch current price, calculate PnL,
+    and write a row to position_checks.  Called every 10 seconds.
+    """
+    for symbol, pos in list(open_positions.items()):
+        try:
+            direction    = pos.get("direction", "LONG")
+            entry_price  = float(pos.get("entry") or 0)
+            qty          = float(pos.get("qty")   or 0)
+            ticker       = exchange.fetch_ticker(symbol)
+            current_price = float(ticker.get("last") or 0)
+            if entry_price <= 0 or current_price <= 0:
+                continue
+            if direction == "LONG":
+                pnl_pct  = (current_price - entry_price) / entry_price * 100
+                pnl_usdt = (current_price - entry_price) * qty
+            else:
+                pnl_pct  = (entry_price - current_price) / entry_price * 100
+                pnl_usdt = (entry_price - current_price) * qty
+            log.info(
+                f"[POS CHECK] {symbol} {direction} | entry={entry_price} "
+                f"now={current_price} | PnL={pnl_pct:+.2f}% / {pnl_usdt:+.4f} USDT | qty={qty}"
+            )
+            db_log_position_check(
+                symbol, direction, entry_price, current_price, pnl_pct, pnl_usdt, qty
+            )
+        except Exception as e:
+            log.debug(f"Position snapshot failed for {symbol}: {e}")
+
+
+def position_monitor_loop(exchange: ccxt.binanceusdm) -> None:
+    """
+    Background thread: every 10 seconds check all open positions,
+    log a snapshot to DB, and detect closes/SL hits.
+    """
+    while True:
+        time.sleep(POSITION_CHECK_INTERVAL)
+        if open_positions:
+            _log_position_snapshots(exchange)
+            sync_open_positions(exchange)
+
+
 def sync_open_positions(exchange: ccxt.binanceusdm) -> None:
     if not open_positions:
         return
@@ -2206,6 +2291,10 @@ def main() -> None:
         log.critical(f"Exchange connection failed: {e}")
         send_telegram(f"*MUESA CRITICAL* — cannot connect to Binance:\n`{e}`")
         return
+
+    # Start background position monitor — checks every 10s, logs to DB
+    threading.Thread(target=position_monitor_loop, args=(exchange,), daemon=True).start()
+    log.info(f"Position monitor started — checking every {POSITION_CHECK_INTERVAL}s.")
 
     while True:
         candle_close = next_candle_close_utc()
