@@ -1612,7 +1612,7 @@ def open_long(
     qty = get_position_size(exchange, symbol, price)
     if qty <= 0:
         log.warning(f"Invalid qty for {symbol}, skipping.")
-        return
+        return False
 
     sl_price  = round(price * (1 - SL_PCT), 8)
     tp1_price = round(price * (1 + TP1_PCT), 8)
@@ -1683,7 +1683,7 @@ def open_short(
     qty = get_position_size(exchange, symbol, price)
     if qty <= 0:
         log.warning(f"Invalid qty for {symbol}, skipping.")
-        return
+        return False
 
     sl_price  = round(price * (1 + SL_PCT), 8)
     tp1_price = round(price * (1 - TP1_PCT), 8)
@@ -1757,17 +1757,17 @@ def sync_open_positions(exchange: ccxt.binanceusdm) -> None:
             pos       = open_positions.pop(sym, {})
             direction = pos.get("direction", "LONG")
             entry     = float(pos.get("entry") or 0)
-            sl        = float(pos.get("sl") or 0)
+            sl_price  = float(pos.get("sl")    or 0)   # actual SL price stored at trade open
 
-            # Detect SL hit by proximity of last price to SL
+            # Detect SL hit: last price at or beyond the stored SL level (with 10% tolerance)
             try:
                 ticker     = exchange.fetch_ticker(sym)
                 last_price = float(ticker.get("last") or 0)
                 sl_hit     = False
-                if direction == "LONG"  and last_price > 0 and entry > 0:
-                    sl_hit = last_price <= entry * (1 - SL_PCT * 0.9)
-                elif direction == "SHORT" and last_price > 0 and entry > 0:
-                    sl_hit = last_price >= entry * (1 + SL_PCT * 0.9)
+                if direction == "LONG"  and last_price > 0 and sl_price > 0:
+                    sl_hit = last_price <= sl_price * 1.001   # within 0.1% above SL
+                elif direction == "SHORT" and last_price > 0 and sl_price > 0:
+                    sl_hit = last_price >= sl_price * 0.999   # within 0.1% below SL
                 if sl_hit:
                     sl_hit_symbols[sym] = time.time()
                     log.info(f"SL hit detected: {sym} — {SL_COOLDOWN_HOURS}h cooldown applied")
@@ -1871,15 +1871,18 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
     for s in expired:
         del sl_hit_symbols[s]
 
-    # Hard limits
+    # Hard limits — finish scan record before returning so DB row isn't left with 0/0/0
     if len(open_positions) >= MAX_OPEN_POSITIONS:
         log.info(f"Max open positions ({MAX_OPEN_POSITIONS}) reached. Skipping scan.")
+        db_finish_scan(_current_scan_id, 0, 0, 0)
         return
     if session_trade_count >= MAX_TRADES_SESSION:
         log.info(f"{session} session trade limit ({MAX_TRADES_SESSION}) reached. Skipping scan.")
+        db_finish_scan(_current_scan_id, 0, 0, 0)
         return
     if daily_trade_count >= MAX_TRADES_DAY:
         log.info(f"Daily trade limit ({MAX_TRADES_DAY}) reached. Skipping scan.")
+        db_finish_scan(_current_scan_id, 0, 0, 0)
         return
 
     # ── BTC context (already fetched above for DB — reuse)
