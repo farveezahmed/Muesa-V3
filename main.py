@@ -1655,47 +1655,61 @@ def _validate_breakout(ohlcv: list, direction: str) -> tuple[bool, float]:
         return (broke and vol_surge and momentum), round(key_level, 8)
 
 
-def _detect_base_breakout(ohlcv: list, direction: str) -> tuple[bool, str]:
-    """
-    4-step Base Breakout detection system:
-      1. BASE       — 15-20 candles sideways consolidation (high-low range < 5% of avg price)
-      2. VOL EXPL   — breakout candle RVOL >= 2.5x the base average volume
-      3. BREAKOUT   — candle closes above base_high (LONG) or below base_low (SHORT)
-      4. MOMENTUM   — body >= 50% of candle range, close in top/bottom 30%
+# ─────────────────────────────────────────────
+#  SCORING: STRUCTURE (Breakout Setup) — 20 pts
+# ─────────────────────────────────────────────
 
-    Searches for the breakout within the last 3-8 closed candles.
-    Pullback entry confirmation is handled downstream by check_entry_candle_quality.
-    Returns (confirmed, description).
+def score_structure_breakout(ohlcv_15m: list, direction: str) -> tuple[float, str]:
     """
-    n = len(ohlcv)
+    STRUCTURE (Breakout Setup) — 20 pts max.
+
+    4-step pump/breakdown setup scoring:
+      Step 1 — BASE         : 15-20 candles sideways (range < 5% of avg price).
+                              Prerequisite — no points alone, qualifies scoring.
+      Step 2 — VOL EXPLOSION: RVOL vs base avg  →  >=3.0x=8, >=2.5x=6, >=2.0x=4, <2.0=skip
+      Step 3 — BREAKOUT     : clean close beyond base boundary
+                              >=2% past = 7 | >=1% past = 5 | marginal = 3
+      Step 4 — MOMENTUM CANDLE : body + close position
+                              body>=60% + close top/bot 25% = 5 | body>=50% + top/bot 30% = 3
+
+    Max total = 8+7+5 = 20 pts.
+    Threshold: score < 15 → return 0 (ignored — not a high-quality structure).
+               score >= 15 → strong structure, counts toward total.
+
+    Pullback entry is confirmed downstream by check_entry_candle_quality.
+    Searches for the breakout candle within the last 3-8 closed candles.
+    Returns (pts, description).
+    """
+    n = len(ohlcv_15m)
     if n < 30:
-        return False, ""
+        return 0.0, ""
 
-    # Scan breakout candle at offsets 3-8 from the end
-    # offset=3 → ohlcv[-3] is breakout, leaving [-2] pullback + [-1] entry forming
+    best_pts  = 0.0
+    best_desc = ""
+
     for offset in range(3, 9):
         if n - offset < 22:
             break
 
-        bo_c         = ohlcv[-offset]
-        base_candles = ohlcv[-(offset + 20):-offset]   # 20 candles before breakout
+        bo_c         = ohlcv_15m[-offset]
+        base_candles = ohlcv_15m[-(offset + 20):-offset]
         if len(base_candles) < 12:
             continue
 
-        b_highs = [float(c[2]) for c in base_candles]
-        b_lows  = [float(c[3]) for c in base_candles]
-        b_cls   = [float(c[4]) for c in base_candles]
-        b_vols  = [float(c[5]) for c in base_candles]
+        b_highs  = [float(c[2]) for c in base_candles]
+        b_lows   = [float(c[3]) for c in base_candles]
+        b_closes = [float(c[4]) for c in base_candles]
+        b_vols   = [float(c[5]) for c in base_candles]
 
         base_high = max(b_highs)
         base_low  = min(b_lows)
-        avg_price = sum(b_cls)  / len(b_cls)
-        avg_vol   = sum(b_vols) / len(b_vols)
+        avg_price = sum(b_closes) / len(b_closes)
+        avg_vol   = sum(b_vols)   / len(b_vols)
 
         if avg_price <= 0 or avg_vol <= 0:
             continue
 
-        # Step 1: Tight base — range < 5%
+        # ── Step 1: Base qualification (< 5% range)
         rng_pct = (base_high - base_low) / avg_price
         if rng_pct > 0.05:
             continue
@@ -1707,117 +1721,64 @@ def _detect_base_breakout(ohlcv: list, direction: str) -> tuple[bool, str]:
         if bo_range <= 0:
             continue
 
-        # Step 2: Volume explosion >= 2.5x
-        bo_rvol = bo_vol / avg_vol
-        if bo_rvol < 2.5:
-            continue
-
+        bo_rvol    = bo_vol / avg_vol
         body_ratio = abs(bo_close - bo_open) / bo_range
+        pts        = 0.0
 
+        # ── Step 2: Volume explosion scoring (max 8 pts)
+        if   bo_rvol >= 3.0: pts += 8.0
+        elif bo_rvol >= 2.5: pts += 6.0
+        elif bo_rvol >= 2.0: pts += 4.0
+        else:
+            continue   # < 2.0x = not a real volume explosion
+
+        # ── Step 3: Breakout scoring (max 7 pts)
         if direction == "LONG":
-            # Step 3: Close above base
             if bo_close <= base_high:
                 continue
-            # Step 4: Strong body, close in top 30%
-            close_pos = (bo_close - bo_low) / bo_range
-            if body_ratio < 0.50 or close_pos < 0.70:
-                continue
-            desc = f"Base({rng_pct:.1%})+VolEx(x{bo_rvol:.1f})+BreakoutUp+MomCandle"
+            bo_pct = (bo_close - base_high) / base_high
+            if   bo_pct >= 0.02: pts += 7.0
+            elif bo_pct >= 0.01: pts += 5.0
+            else:                pts += 3.0
         else:
-            # Step 3: Close below base
             if bo_close >= base_low:
                 continue
-            # Step 4: Strong body, close in bottom 30%
+            bo_pct = (base_low - bo_close) / base_low
+            if   bo_pct >= 0.02: pts += 7.0
+            elif bo_pct >= 0.01: pts += 5.0
+            else:                pts += 3.0
+
+        # ── Step 4: Momentum candle scoring (max 5 pts)
+        if direction == "LONG":
+            close_pos = (bo_close - bo_low) / bo_range
+            if   body_ratio >= 0.60 and close_pos >= 0.75: pts += 5.0
+            elif body_ratio >= 0.50 and close_pos >= 0.70: pts += 3.0
+        else:
             close_pos = (bo_high - bo_close) / bo_range
-            if body_ratio < 0.50 or close_pos < 0.70:
-                continue
-            desc = f"Base({rng_pct:.1%})+VolEx(x{bo_rvol:.1f})+BreakdownLow+MomCandle"
+            if   body_ratio >= 0.60 and close_pos >= 0.75: pts += 5.0
+            elif body_ratio >= 0.50 and close_pos >= 0.70: pts += 3.0
 
-        log.debug(f"BaseBreakout [{direction}] @offset-{offset}: {desc}")
-        return True, desc
+        log.debug(
+            f"Structure [{direction}] @-{offset}: base={rng_pct:.1%} "
+            f"rvol=x{bo_rvol:.1f} pts={pts:.0f}"
+        )
 
-    return False, ""
+        if pts > best_pts:
+            best_pts = pts
+            direction_label = "Breakout" if direction == "LONG" else "Breakdown"
+            best_desc = (
+                f"Base({rng_pct:.1%})+VolEx(x{bo_rvol:.1f})"
+                f"+{direction_label}({bo_pct:.1%})+Momentum"
+            )
 
-
-def score_chart_patterns(ohlcv_15m: list, direction: str) -> tuple[float, str]:
-    """
-    Chart pattern scoring — 8 pts max:
-      Very Strong (8): Base Breakout (4-step system — highest priority)
-                    OR Phase2 all 3 components (candle+structure+breakout)
-                    OR Bottom Bounce LONG (20% drop, oversold RSI, vol surge, EMA turning)
-      Strong      (6): Market structure + double bottom/top confirmation
-      Moderate    (4): Market structure aligned only
-    Returns (pts, description).
-    """
-    if len(ohlcv_15m) < 30:
+    # ── Threshold: < 15 pts = not a strong enough setup → ignore
+    if best_pts < 15.0:
+        if best_pts > 0:
+            log.debug(f"Structure [{direction}]: {best_pts:.0f}pts < 15 threshold → ignored")
         return 0.0, ""
 
-    # ── PRIORITY 1 — Very Strong: Base Breakout (4-step: base→vol→break→momentum)
-    base_ok, base_desc = _detect_base_breakout(ohlcv_15m, direction)
-    if base_ok:
-        return 8.0, base_desc
-
-    highs = [float(c[2]) for c in ohlcv_15m]
-    lows  = [float(c[3]) for c in ohlcv_15m]
-
-    # ── PRIORITY 2 — Very Strong: Phase2 (candle + structure + breakout all agree)
-    pattern_ok,   pattern_name = _detect_candle_pattern(ohlcv_15m, direction)
-    structure_ok, struct_label = _detect_market_structure(highs, lows, direction)
-    breakout_ok,  key_level    = _validate_breakout(ohlcv_15m, direction)
-
-    log.debug(
-        f"ChartPtn [{direction}]: base=False candle={pattern_ok}({pattern_name}) "
-        f"structure={structure_ok}({struct_label}) breakout={breakout_ok}(lvl={key_level})"
-    )
-
-    if pattern_ok and structure_ok and breakout_ok:
-        desc = f"{pattern_name}+{struct_label}+BO@{key_level:.4f}"
-        return 8.0, desc
-
-    # ── Very Strong: Bottom Bounce (LONG only — all 5 conditions)
-    if direction == "LONG" and len(ohlcv_15m) >= 50:
-        closes  = [float(c[4]) for c in ohlcv_15m]
-        volumes = [float(c[5]) for c in ohlcv_15m]
-        window_48 = closes[-49:-1]
-        high_48   = max(window_48) if window_48 else 0
-        price_now = closes[-1]
-        drop_pct  = (high_48 - price_now) / high_48 if high_48 > 0 else 0.0
-        if drop_pct >= 0.20:
-            rsi_oversold = False
-            for i in range(len(closes) - 10, len(closes)):
-                if i >= RSI_PERIOD:
-                    r = calc_rsi(closes[:i + 1], RSI_PERIOD)
-                    if r < 30:
-                        rsi_oversold = True
-                        break
-            recent_low  = min(closes[-10:])
-            bounce_pct  = (price_now - recent_low) / recent_low if recent_low > 0 else 0.0
-            avg_vol_20  = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else 0
-            vol_surge   = avg_vol_20 > 0 and volumes[-1] >= avg_vol_20 * 1.5
-            ema7_arr    = calc_ema(closes,       EMA_SHORT)
-            ema7_prev   = calc_ema(closes[:-3],  EMA_SHORT) if len(closes) > 3 else ema7_arr
-            ema_up      = (ema7_arr[-1] if ema7_arr else 0) > (ema7_prev[-1] if ema7_prev else 0)
-            if rsi_oversold and bounce_pct >= 0.03 and vol_surge and ema_up:
-                return 8.0, "Bottom Bounce"
-
-    # ── Strong: Market structure + double bottom/top
-    if structure_ok:
-        double_pattern = False
-        if len(lows) >= 20:
-            if direction == "LONG":
-                sorted_lows = sorted(lows[-20:])
-                if len(sorted_lows) >= 2 and abs(sorted_lows[0] - sorted_lows[1]) / (sorted_lows[0] + 1e-9) < 0.02:
-                    double_pattern = True
-            else:
-                sorted_highs = sorted(highs[-20:], reverse=True)
-                if len(sorted_highs) >= 2 and abs(sorted_highs[0] - sorted_highs[1]) / (sorted_highs[0] + 1e-9) < 0.02:
-                    double_pattern = True
-        if double_pattern:
-            dbl_label = "Double Bottom" if direction == "LONG" else "Double Top"
-            return 6.0, f"{struct_label}+{dbl_label}"
-        return 4.0, struct_label
-
-    return 0.0, ""
+    log.info(f"Structure [{direction}]: STRONG {best_pts:.0f}pts — {best_desc}")
+    return best_pts, best_desc
 
 # ─────────────────────────────────────────────
 #  PATTERN 1: FIBONACCI RETRACEMENT — up to 10 pts
@@ -2049,11 +2010,11 @@ def compute_score(
     if fib_label:
         details.setdefault("entry_reasons", []).append(fib_label)
 
-    # ── Chart Patterns (8 pts tiered)
-    chart_pts, chart_desc = score_chart_patterns(ohlcv_15m, direction)
-    details["chart_pts"] = round(chart_pts, 1)
-    if chart_desc:
-        details.setdefault("entry_reasons", []).append(f"ChartPtn: {chart_desc}")
+    # ── Structure: Breakout Setup (0–20 pts; < 15 = 0, >= 15 = strong)
+    structure_pts, structure_desc = score_structure_breakout(ohlcv_15m, direction)
+    details["structure_pts"] = round(structure_pts, 1)
+    if structure_desc:
+        details.setdefault("entry_reasons", []).append(f"Structure: {structure_desc}")
 
     # ── Candlestick (7 pts tiered)
     candle_pts, candle_name = score_candlestick(ohlcv_15m, direction)
@@ -2080,7 +2041,7 @@ def compute_score(
     layer1_vol     = rvol_ratio >= 1.2
     layer2_oi      = oi_pts >= 8.0
     layer3_trend   = trend_confirmed                         # all 3 LTF (already gated above)
-    layer4_struct  = (retest_pts > 0 or chart_pts > 0)
+    layer4_struct  = (retest_pts > 0 or structure_pts > 0)
     layer5_fib     = fib_pts > 0
     layer6_rsi     = rsi_pts >= 3
 
@@ -2121,7 +2082,7 @@ def compute_score(
     details["confluence_count"] = confluence_count
 
     total = (htf_pts + ltf_pts + rvol_pts + oi_pts + retest_pts
-             + fib_pts + chart_pts + candle_pts + fund_pts + rsi_pts)
+             + fib_pts + structure_pts + candle_pts + fund_pts + rsi_pts)
     total = max(0.0, min(100.0, total))
 
     details["price"] = round(price_now, 8)
@@ -2146,7 +2107,7 @@ def call_claude(symbol: str, details: dict, direction: str) -> tuple[float, str]
     client = anthropic.Anthropic(api_key=api_key)
 
     fib_label    = next((r for r in details.get("entry_reasons", []) if r.startswith("Fibonacci")), "n/a")
-    chart_label  = next((r for r in details.get("entry_reasons", []) if r.startswith("ChartPtn")), "n/a")
+    struct_label2 = next((r for r in details.get("entry_reasons", []) if r.startswith("Structure")), "n/a")
     candle_label = next((r for r in details.get("entry_reasons", []) if r.startswith("Candle")), "n/a")
     retest_label = next((r for r in details.get("entry_reasons", []) if r.startswith("Retest")), "n/a")
     size_pct     = int(details.get("size_mult", 1.0) * 100)
@@ -2162,7 +2123,7 @@ Score breakdown (100 pts system):
   Open Interest        : {details.get('oi_pts', 0)} / 8
   Retest (staged)      : {retest_label} / 12
   Fibonacci            : {fib_label} / 10
-  Chart Pattern        : {chart_label} / 8
+  Structure (Breakout) : {struct_label2} / 20  (min 15 to count)
   Candlestick          : {candle_label} / 7
   Funding Rate         : {details.get('fund_pts', 0)} / 4
   RSI ({details.get('rsi', 'N/A')})             : {details.get('rsi_pts', 0)} / 4
@@ -2265,7 +2226,7 @@ def _build_trade_alert(
         f"OI           : `{details.get('oi_pts', 0)}` / 8\n"
         f"Retest       : `{details.get('retest_pts', 0)}` / 12\n"
         f"Fibonacci    : `{details.get('fib_pts', 0)}` / 10\n"
-        f"Chart Ptn    : `{details.get('chart_pts', 0)}` / 8\n"
+        f"Structure    : `{details.get('structure_pts', 0)}` / 20  (15+ = strong)\n"
         f"Candlestick  : `{details.get('candle_pts', 0)}` / 7\n"
         f"Funding      : `{details.get('fund_pts', 0)}` / 4\n"
         f"RSI ({details.get('rsi','?')})    : `{details.get('rsi_pts', 0)}` / 4\n"
