@@ -1196,31 +1196,26 @@ def score_volume_oi(
     elif vol_24h >= VOLUME_FLOOR_USDT: vol_pts = 2.0  # >= $50M (floor, low score)
     else:                              vol_pts = 0.0
 
-    # ── RVOL (relative volume vs 20-bar candle avg)
-    # Hard block when RVOL < 0.5 — no negative scoring, just skip entirely.
+    # ── RVOL — compute ratio first, early return if below hard block threshold
     rvol_pts   = 0.0
     rvol_ratio = 0.0
-    blocked    = False
 
     if len(ohlcv_15m) >= 21:
         volumes = [c[5] for c in ohlcv_15m]
         avg_vol = sum(volumes[-21:-1]) / 20
         if avg_vol > 0:
-            rvol       = volumes[-1] / avg_vol
-            rvol_ratio = round(rvol, 3)
-            if   rvol >= 2.0: rvol_pts = 12.0
-            elif rvol >= 1.5: rvol_pts = 9.0
-            elif rvol >= 1.0: rvol_pts = 6.0
-            elif rvol >= 0.5: rvol_pts = 3.0
-            else:
-                rvol_pts = 0.0   # FIX 1: no negative scoring — hard block below
-                blocked  = True
+            rvol_ratio = round(volumes[-1] / avg_vol, 3)
 
+    # Hard block: RVOL < 0.5 → early return, no further scoring
     if rvol_ratio < 0.5:
-        blocked  = True
-        rvol_pts = 0.0   # guarantee no negative value reaches the total
+        return vol_pts, 0.0, 0.0, 0.0, True, rvol_ratio
 
-    # ── OI (open interest direction)
+    if   rvol_ratio >= 2.0: rvol_pts = 12.0
+    elif rvol_ratio >= 1.5: rvol_pts = 9.0
+    elif rvol_ratio >= 1.0: rvol_pts = 6.0
+    else:                   rvol_pts = 3.0   # 0.5–1.0
+
+    # ── OI (open interest direction) — only reached when RVOL >= 0.5
     oi_pts = 0.0
     try:
         history = exchange.fetch_open_interest_history(symbol, "15m", limit=3)
@@ -1242,7 +1237,7 @@ def score_volume_oi(
         log.debug(f"OI fetch failed for {symbol}: {e}")
 
     total = vol_pts + rvol_pts + oi_pts
-    return vol_pts, rvol_pts, oi_pts, total, blocked, rvol_ratio
+    return vol_pts, rvol_pts, oi_pts, total, False, rvol_ratio
 
 # ─────────────────────────────────────────────
 #  SCORING: MARKET STRUCTURE BONUS — 5 pts
@@ -1332,45 +1327,35 @@ def check_entry_candle_quality(ohlcv_15m: list, direction: str) -> tuple[bool, s
     return True, ""
 
 
-def _check_entry_candle_strict(ohlcv_15m: list, direction: str) -> tuple[bool, str]:
+def _check_entry_candle_strict(ohlcv: list, direction: str) -> tuple[bool, str | None]:
     """
     FIX 3 — Strict entry candle filter applied BEFORE order execution.
-    Checks the last fully closed 15m candle (ohlcv_15m[-2]).
+    Uses the current (latest) candle ohlcv[-1].
 
     LONG  : close > open  |  body >= 60% of range  |  close in top 30%
     SHORT : close < open  |  body >= 60% of range  |  close in bottom 30%
 
-    Returns (passed, reason_if_failed).
+    Returns (True, None) on pass, (False, "weak_candle") on fail.
     """
-    if len(ohlcv_15m) < 2:
-        return False, "insufficient candle data"
+    c      = ohlcv[-1]
+    open_  = c[1]; high = c[2]; low = c[3]; close = c[4]
+    range_ = high - low
 
-    c   = ohlcv_15m[-2]          # last fully closed candle
-    o   = float(c[1]); h = float(c[2])
-    l   = float(c[3]); cl = float(c[4])
-    rng = h - l
+    if range_ == 0:
+        return False, "zero_range"
 
-    if rng <= 0:
-        return False, "zero range candle"
-
-    body      = abs(cl - o) / rng
-    close_pos = (cl - l)   / rng   # 0 = at low, 1 = at high
-
-    if body < 0.60:
-        return False, f"body {body:.0%} < 60% (weak candle)"
+    body = abs(close - open_)
 
     if direction == "LONG":
-        if cl <= o:
-            return False, "candle not bullish (close <= open)"
-        if close_pos < 0.70:          # close must be in top 30%
-            return False, f"close at {close_pos:.0%} of range (need >= 70%)"
-    else:  # SHORT
-        if cl >= o:
-            return False, "candle not bearish (close >= open)"
-        if close_pos > 0.30:          # close must be in bottom 30%
-            return False, f"close at {close_pos:.0%} of range (need <= 30%)"
+        cond = (close > open_ and
+                body / range_ >= 0.6 and
+                close >= high - (range_ * 0.3))
+    else:
+        cond = (close < open_ and
+                body / range_ >= 0.6 and
+                close <= low + (range_ * 0.3))
 
-    return True, ""
+    return cond, None if cond else "weak_candle"
 
 
 # ─────────────────────────────────────────────
@@ -2161,7 +2146,8 @@ def compute_score(
         base_bo_pts = 15.0
         details.setdefault("entry_reasons", []).append(f"BaseBO: {base_bo_desc}")
         log.info(f"Base Breakout +15 confirmed [{direction}]: {base_bo_desc}")
-    details["base_bo_pts"] = round(base_bo_pts, 1)
+    details["base_bo_pts"]   = round(base_bo_pts, 1)
+    details["structure_pts"] = round(base_bo_pts, 1)   # structure slot = base breakout bonus
 
     # ── Candlestick (7 pts tiered)
     candle_pts, candle_name = score_candlestick(ohlcv_15m, direction)
@@ -2228,9 +2214,9 @@ def compute_score(
     details["size_mult"]       = size_mult
     details["confluence_count"] = confluence_count
 
-    total = (htf_pts + ltf_pts + vol_pts + rvol_pts + oi_pts + retest_pts
-             + fib_pts + structure_pts + base_bo_pts + candle_pts + fund_pts + rsi_pts)
-    total = max(0.0, min(100.0, total))
+    total = (htf_pts + ltf_pts + vol_total + retest_pts
+             + fib_pts + base_bo_pts + candle_pts + fund_pts + rsi_pts)
+    total = min(100.0, total)
 
     details["price"] = round(price_now, 8)
     details["total"] = round(total, 1)
