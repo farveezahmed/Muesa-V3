@@ -1655,10 +1655,95 @@ def _validate_breakout(ohlcv: list, direction: str) -> tuple[bool, float]:
         return (broke and vol_surge and momentum), round(key_level, 8)
 
 
+def _detect_base_breakout(ohlcv: list, direction: str) -> tuple[bool, str]:
+    """
+    4-step Base Breakout detection system:
+      1. BASE       — 15-20 candles sideways consolidation (high-low range < 5% of avg price)
+      2. VOL EXPL   — breakout candle RVOL >= 2.5x the base average volume
+      3. BREAKOUT   — candle closes above base_high (LONG) or below base_low (SHORT)
+      4. MOMENTUM   — body >= 50% of candle range, close in top/bottom 30%
+
+    Searches for the breakout within the last 3-8 closed candles.
+    Pullback entry confirmation is handled downstream by check_entry_candle_quality.
+    Returns (confirmed, description).
+    """
+    n = len(ohlcv)
+    if n < 30:
+        return False, ""
+
+    # Scan breakout candle at offsets 3-8 from the end
+    # offset=3 → ohlcv[-3] is breakout, leaving [-2] pullback + [-1] entry forming
+    for offset in range(3, 9):
+        if n - offset < 22:
+            break
+
+        bo_c         = ohlcv[-offset]
+        base_candles = ohlcv[-(offset + 20):-offset]   # 20 candles before breakout
+        if len(base_candles) < 12:
+            continue
+
+        b_highs = [float(c[2]) for c in base_candles]
+        b_lows  = [float(c[3]) for c in base_candles]
+        b_cls   = [float(c[4]) for c in base_candles]
+        b_vols  = [float(c[5]) for c in base_candles]
+
+        base_high = max(b_highs)
+        base_low  = min(b_lows)
+        avg_price = sum(b_cls)  / len(b_cls)
+        avg_vol   = sum(b_vols) / len(b_vols)
+
+        if avg_price <= 0 or avg_vol <= 0:
+            continue
+
+        # Step 1: Tight base — range < 5%
+        rng_pct = (base_high - base_low) / avg_price
+        if rng_pct > 0.05:
+            continue
+
+        bo_open  = float(bo_c[1]); bo_high = float(bo_c[2])
+        bo_low   = float(bo_c[3]); bo_close = float(bo_c[4])
+        bo_vol   = float(bo_c[5])
+        bo_range = bo_high - bo_low
+        if bo_range <= 0:
+            continue
+
+        # Step 2: Volume explosion >= 2.5x
+        bo_rvol = bo_vol / avg_vol
+        if bo_rvol < 2.5:
+            continue
+
+        body_ratio = abs(bo_close - bo_open) / bo_range
+
+        if direction == "LONG":
+            # Step 3: Close above base
+            if bo_close <= base_high:
+                continue
+            # Step 4: Strong body, close in top 30%
+            close_pos = (bo_close - bo_low) / bo_range
+            if body_ratio < 0.50 or close_pos < 0.70:
+                continue
+            desc = f"Base({rng_pct:.1%})+VolEx(x{bo_rvol:.1f})+BreakoutUp+MomCandle"
+        else:
+            # Step 3: Close below base
+            if bo_close >= base_low:
+                continue
+            # Step 4: Strong body, close in bottom 30%
+            close_pos = (bo_high - bo_close) / bo_range
+            if body_ratio < 0.50 or close_pos < 0.70:
+                continue
+            desc = f"Base({rng_pct:.1%})+VolEx(x{bo_rvol:.1f})+BreakdownLow+MomCandle"
+
+        log.debug(f"BaseBreakout [{direction}] @offset-{offset}: {desc}")
+        return True, desc
+
+    return False, ""
+
+
 def score_chart_patterns(ohlcv_15m: list, direction: str) -> tuple[float, str]:
     """
     Chart pattern scoring — 8 pts max:
-      Very Strong (8): Phase2 all 3 components (candle+structure+breakout)
+      Very Strong (8): Base Breakout (4-step system — highest priority)
+                    OR Phase2 all 3 components (candle+structure+breakout)
                     OR Bottom Bounce LONG (20% drop, oversold RSI, vol surge, EMA turning)
       Strong      (6): Market structure + double bottom/top confirmation
       Moderate    (4): Market structure aligned only
@@ -1667,16 +1752,21 @@ def score_chart_patterns(ohlcv_15m: list, direction: str) -> tuple[float, str]:
     if len(ohlcv_15m) < 30:
         return 0.0, ""
 
+    # ── PRIORITY 1 — Very Strong: Base Breakout (4-step: base→vol→break→momentum)
+    base_ok, base_desc = _detect_base_breakout(ohlcv_15m, direction)
+    if base_ok:
+        return 8.0, base_desc
+
     highs = [float(c[2]) for c in ohlcv_15m]
     lows  = [float(c[3]) for c in ohlcv_15m]
 
-    # ── Very Strong: Phase2 (candle + structure + breakout all agree)
+    # ── PRIORITY 2 — Very Strong: Phase2 (candle + structure + breakout all agree)
     pattern_ok,   pattern_name = _detect_candle_pattern(ohlcv_15m, direction)
     structure_ok, struct_label = _detect_market_structure(highs, lows, direction)
     breakout_ok,  key_level    = _validate_breakout(ohlcv_15m, direction)
 
     log.debug(
-        f"ChartPtn [{direction}]: candle={pattern_ok}({pattern_name}) "
+        f"ChartPtn [{direction}]: base=False candle={pattern_ok}({pattern_name}) "
         f"structure={structure_ok}({struct_label}) breakout={breakout_ok}(lvl={key_level})"
     )
 
