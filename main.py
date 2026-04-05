@@ -1120,42 +1120,24 @@ def fetch_multi_tf_ohlcv(exchange: ccxt.binanceusdm, symbol: str) -> dict[str, l
     return result
 
 # ─────────────────────────────────────────────
-#  SCORING: HTF TREND — 25 pts
+#  SCORING: HTF TREND — 20 pts
 # ─────────────────────────────────────────────
 
 def score_htf_trend(ohlcv_by_tf: dict, direction: str) -> tuple[float, bool]:
     """
-    1W: EMA7 vs EMA25 aligned → +15
-    1D: EMA7 vs EMA25 aligned → +10
-    Hard block if 1D strongly opposing (EMA diff > 0.5%).
-    Returns (points, blocked).
+    1W aligned → +10 | 1D aligned → +10 | both → +20 | one → +10 | none → 0.
+    No hard block — opposing daily is just 0 pts.
+    Returns (points, False).
     """
     points = 0.0
 
-    # ── 1W
     candles_1w = ohlcv_by_tf.get("1w", [])
     if ema_aligned(candles_1w, direction):
-        points += 15.0
+        points += 10.0
 
-    # ── 1D
     candles_1d = ohlcv_by_tf.get("1d", [])
-    if len(candles_1d) >= EMA_MID + 3:
-        closes    = [c[4] for c in candles_1d]
-        ema7_arr  = calc_ema(closes, EMA_SHORT)
-        ema25_arr = calc_ema(closes, EMA_MID)
-        if ema7_arr and ema25_arr:
-            ema7     = ema7_arr[-1]
-            ema25    = ema25_arr[-1]
-            diff_pct = abs(ema7 - ema25) / ema25
-            # Block if 1D strongly opposing (>0.5% separation wrong way)
-            if direction == "LONG"  and ema7 < ema25 and diff_pct > 0.005:
-                return points, True
-            if direction == "SHORT" and ema7 > ema25 and diff_pct > 0.005:
-                return points, True
-            if direction == "LONG"  and ema7 > ema25:
-                points += 10.0
-            if direction == "SHORT" and ema7 < ema25:
-                points += 10.0
+    if ema_aligned(candles_1d, direction):
+        points += 10.0
 
     return points, False
 
@@ -1164,18 +1146,15 @@ def score_htf_trend(ohlcv_by_tf: dict, direction: str) -> tuple[float, bool]:
 # ─────────────────────────────────────────────
 
 # ─────────────────────────────────────────────
-#  SCORING: LTF ALIGNMENT — 20 pts
+#  SCORING: LTF ALIGNMENT — 15 pts
 # ─────────────────────────────────────────────
 
 def score_ltf_alignment(ohlcv_by_tf: dict, direction: str) -> tuple[float, int, bool]:
     """
-    Trend alignment check across 4 timeframes.
-    1D = filter only (0 pts — points already in HTF score).
-    4H = +7 | 1H = +7 | 15m = +6 if EMA7 > EMA25 aligned with direction.
-    Trend confirmed (not blocked) when >= 3 of 4 TFs align.
+    Trend alignment: 4H=+5, 1H=+5, 15m=+5 — ALL 3 must align (hard block if <3/3).
     Returns (points, aligned_count, trend_confirmed).
     """
-    tf_weights = {"1d": 0.0, "4h": 7.0, "1h": 7.0, "15m": 6.0}
+    tf_weights = {"4h": 5.0, "1h": 5.0, "15m": 5.0}
     points        = 0.0
     aligned_count = 0
 
@@ -1188,47 +1167,43 @@ def score_ltf_alignment(ohlcv_by_tf: dict, direction: str) -> tuple[float, int, 
     return points, aligned_count, aligned_count >= 3
 
 # ─────────────────────────────────────────────
-#  SCORING: VOLUME & OI — ~20 pts
+#  SCORING: VOLUME & OI — 20 pts
 # ─────────────────────────────────────────────
 
 def _oi_value(entry: dict) -> float:
     return float(entry.get("openInterestValue") or entry.get("openInterest") or 0)
 
 def score_volume_oi(
-    vol_24h: float,
     ohlcv_15m: list,
     exchange: ccxt.binanceusdm,
     symbol: str,
     direction: str,
     price_now: float,
     price_prev: float,
-) -> tuple[float, float, float, float, bool]:
+) -> tuple[float, float, float, bool, float]:
     """
-    Base vol: >500M=+15, 200M–500M=+12, <200M=+9.
-    RVOL    : >2x=+10, 1.5x=+7, 1.2x=+4, <0.5x=-15.
-    OI      : aligned with direction = +10.
-    No coins are skipped on volume — all top-100 coins are scored.
-    Returns (vol_pts, rvol_pts, oi_pts, total, skip_coin=False always).
+    RVOL: >2.0=12, 1.5-2.0=9, 1.0-1.5=6, 0.5-1.0=3, <0.5=hard block.
+    OI  : rising+direction=8, flat (<0.1% change)=3, falling/against=0.
+    Returns (rvol_pts, oi_pts, total, blocked, rvol_ratio).
     """
-    if vol_24h >= HIGH_USDT_VOLUME:
-        vol_pts = 15.0
-    elif vol_24h >= MIN_USDT_VOLUME:
-        vol_pts = 12.0
-    else:
-        vol_pts = 9.0   # low vol but still in top 100 — minor points
-
     rvol_pts   = 0.0
     rvol_ratio = 0.0
+    blocked    = False
+
     if len(ohlcv_15m) >= 21:
         volumes = [c[5] for c in ohlcv_15m]
         avg_vol = sum(volumes[-21:-1]) / 20
         if avg_vol > 0:
             rvol       = volumes[-1] / avg_vol
             rvol_ratio = round(rvol, 3)
-            if   rvol >= 2.0: rvol_pts = 10.0
-            elif rvol >= 1.5: rvol_pts = 7.0
-            elif rvol >= 1.2: rvol_pts = 4.0
-            elif rvol < 0.5:  rvol_pts = -15.0
+            if   rvol >= 2.0: rvol_pts = 12.0
+            elif rvol >= 1.5: rvol_pts = 9.0
+            elif rvol >= 1.0: rvol_pts = 6.0
+            elif rvol >= 0.5: rvol_pts = 3.0
+            else:             blocked  = True
+
+    if rvol_ratio < 0.5:
+        blocked = True
 
     oi_pts = 0.0
     try:
@@ -1237,15 +1212,21 @@ def score_volume_oi(
             oi_now  = _oi_value(history[-1])
             oi_prev = _oi_value(history[-2])
             if oi_prev > 0:
+                oi_chg_pct   = abs(oi_now - oi_prev) / oi_prev
                 oi_rising    = oi_now > oi_prev
+                oi_flat      = oi_chg_pct < 0.001
                 price_rising = price_now > price_prev
-                if direction == "LONG"  and oi_rising and price_rising:     oi_pts = 10.0
-                if direction == "SHORT" and not oi_rising and not price_rising: oi_pts = 10.0
+                if direction == "LONG":
+                    if oi_rising and price_rising: oi_pts = 8.0
+                    elif oi_flat:                  oi_pts = 3.0
+                else:
+                    if not oi_rising and not price_rising: oi_pts = 8.0
+                    elif oi_flat:                          oi_pts = 3.0
     except Exception as e:
         log.debug(f"OI fetch failed for {symbol}: {e}")
 
-    total = vol_pts + rvol_pts + oi_pts
-    return vol_pts, rvol_pts, oi_pts, total, False, rvol_ratio
+    total = rvol_pts + oi_pts
+    return rvol_pts, oi_pts, total, blocked, rvol_ratio
 
 # ─────────────────────────────────────────────
 #  SCORING: MARKET STRUCTURE BONUS — 5 pts
@@ -1335,7 +1316,7 @@ def check_entry_candle_quality(ohlcv_15m: list, direction: str) -> tuple[bool, s
     return True, ""
 
 # ─────────────────────────────────────────────
-#  SCORING: RETEST DETECTION — 15 pts
+#  SCORING: RETEST DETECTION — 12 pts staged
 # ─────────────────────────────────────────────
 
 def score_retest_detection(
@@ -1344,32 +1325,18 @@ def score_retest_detection(
     direction: str,
 ) -> tuple[float, bool]:
     """
-    If coin moved ≥15% in last 4H candle:
-      Check all 5 retest conditions.
-      All 5 met  → +15, allow trade (confirmed retest).
-      Any fail   → BLOCK (don't chase the move).
-    If coin moved <15% → (0, False) — retest check not required.
-
-    Conditions for LONG (buy the dip after pump):
-      1. Price pulled back ≥10% from recent high.
-      2. Price within 2% of EMA7, EMA25, or recent swing low.
-      3. Volume declining on last 3 pullback candles.
-      4. RSI reset to 40–55.
-      5. Current candle is green (close > open).
-
-    Conditions for SHORT (short the dead-cat bounce after dump):
-      1. Price bounced ≥10% from recent low.
-      2. Price within 2% of EMA7, EMA25, or recent swing high.
-      3. Volume declining on last 3 bounce candles.
-      4. RSI reset to 45–60.
-      5. Current candle is red (close < open).
-
-    Returns (points, blocked).
+    Staged retest scoring — only activates when 4H move >= 15%.
+    Points awarded per confirmed condition (no hard block):
+      Break + Volume   : +2  (key level broken with vol surge)
+      Pullback         : +3  (price pulled back/bounced >= 10% from extreme)
+      Rejection Wick   : +3  (wick touched key level within 2%)
+      Volume Spike     : +2  (current vol >= 1.5x avg at the retest)
+      Confirm Candle   : +2  (candle closes in direction's favor)
+    Returns (points, False).  Never blocks.
     """
     if not ohlcv_4h or not ohlcv_15m:
         return 0.0, False
 
-    # ── Check 4H move magnitude
     last_4h = ohlcv_4h[-1]
     open_4h = float(last_4h[1])
     if open_4h == 0:
@@ -1377,77 +1344,60 @@ def score_retest_detection(
 
     move_4h = abs(float(last_4h[4]) - open_4h) / open_4h
     if move_4h < COIN_MOVE_4H_PCT:
-        return 0.0, False   # <15% move — retest check not required, no block
+        return 0.0, False   # <15% move — retest check not triggered
 
-    # ── 15%+ move detected — evaluate all 5 conditions
-    closes  = [c[4] for c in ohlcv_15m]
-    highs   = [c[2] for c in ohlcv_15m]
-    lows    = [c[3] for c in ohlcv_15m]
-    volumes = [c[5] for c in ohlcv_15m]
+    closes  = [float(c[4]) for c in ohlcv_15m]
+    highs   = [float(c[2]) for c in ohlcv_15m]
+    lows    = [float(c[3]) for c in ohlcv_15m]
+    volumes = [float(c[5]) for c in ohlcv_15m]
     last_c  = ohlcv_15m[-1]
-    price   = float(closes[-1])
+    avg_vol = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else 0.0
+    points  = 0.0
 
-    ema7_arr  = calc_ema(closes, EMA_SHORT)
-    ema25_arr = calc_ema(closes, EMA_MID)
-    ema7      = ema7_arr[-1]  if ema7_arr  else price
-    ema25     = ema25_arr[-1] if ema25_arr else price
-
-    def near(level: float) -> bool:
-        return abs(price - level) / price <= 0.02
+    # Break + Volume: key level broken with volume surge
+    breakout_ok, _ = _validate_breakout(ohlcv_15m, direction)
+    if breakout_ok:
+        points += 2.0
 
     if direction == "LONG":
-        # Cond 1: pulled back ≥10% from recent 20-candle high
-        recent_high = max(highs[-20:]) if len(highs) >= 20 else max(highs)
-        cond1 = recent_high > 0 and (recent_high - price) / recent_high >= 0.10
+        recent_high  = max(highs[-20:]) if len(highs) >= 20 else max(highs)
+        key_level    = min(lows[-13:-3]) if len(lows) >= 13 else min(lows)
+        wick_touch   = float(last_c[3])   # low wick
+        confirm_ok   = float(last_c[4]) > float(last_c[1])  # green close
 
-        # Cond 2: price within 2% of EMA7, EMA25, or recent swing low
-        swing_low = min(lows[-10:]) if len(lows) >= 10 else min(lows)
-        cond2 = near(ema7) or near(ema25) or near(swing_low)
-
-        # Cond 3: volume declining across last 3 closed candles
-        pull_vols = volumes[-4:-1]
-        cond3 = len(pull_vols) == 3 and all(pull_vols[i] >= pull_vols[i + 1] for i in range(2))
-
-        # Cond 4: RSI reset to 40–55
-        rsi   = calc_rsi(closes, RSI_PERIOD)
-        cond4 = 40 <= rsi <= 55
-
-        # Cond 5: current candle is green
-        cond5 = float(last_c[4]) > float(last_c[1])
+        # Pullback: >= 10% from recent high
+        if recent_high > 0 and (recent_high - closes[-1]) / recent_high >= 0.10:
+            points += 3.0
+        # Rejection Wick: low wick within 2% of key support
+        if key_level > 0 and abs(wick_touch - key_level) / key_level <= 0.02:
+            points += 3.0
 
     else:  # SHORT
-        # Cond 1: bounced ≥10% from recent 20-candle low (dead-cat)
-        recent_low = min(lows[-20:]) if len(lows) >= 20 else min(lows)
-        cond1 = recent_low > 0 and (price - recent_low) / recent_low >= 0.10
+        recent_low   = min(lows[-20:]) if len(lows) >= 20 else min(lows)
+        key_level    = max(highs[-13:-3]) if len(highs) >= 13 else max(highs)
+        wick_touch   = float(last_c[2])   # high wick
+        confirm_ok   = float(last_c[4]) < float(last_c[1])  # red close
 
-        # Cond 2: price within 2% of EMA7, EMA25, or recent swing high
-        swing_high = max(highs[-10:]) if len(highs) >= 10 else max(highs)
-        cond2 = near(ema7) or near(ema25) or near(swing_high)
+        # Bounce: >= 10% from recent low
+        if recent_low > 0 and (closes[-1] - recent_low) / recent_low >= 0.10:
+            points += 3.0
+        # Rejection Wick: high wick within 2% of key resistance
+        if key_level > 0 and abs(wick_touch - key_level) / key_level <= 0.02:
+            points += 3.0
 
-        # Cond 3: volume declining on last 3 bounce candles
-        pull_vols = volumes[-4:-1]
-        cond3 = len(pull_vols) == 3 and all(pull_vols[i] >= pull_vols[i + 1] for i in range(2))
+    # Volume Spike: current vol >= 1.5x average
+    if avg_vol > 0 and volumes[-1] >= avg_vol * 1.5:
+        points += 2.0
 
-        # Cond 4: RSI reset to 45–60
-        rsi   = calc_rsi(closes, RSI_PERIOD)
-        cond4 = 45 <= rsi <= 60
+    # Confirm Candle: closes in direction's favor
+    if confirm_ok:
+        points += 2.0
 
-        # Cond 5: current candle is red (rejection)
-        cond5 = float(last_c[4]) < float(last_c[1])
-
-    conditions = (cond1, cond2, cond3, cond4, cond5)
-    log.debug(
-        f"Retest check ({direction}) — "
-        f"pullback={cond1} near_level={cond2} vol_decline={cond3} "
-        f"rsi={cond4} candle={cond5}"
-    )
-
-    if all(conditions):
-        return 15.0, False   # confirmed retest — bonus points, allow trade
-    return 0.0, True         # 15%+ move but retest not confirmed — BLOCK
+    log.debug(f"Retest staged [{direction}]: 4H_move={move_4h:.1%} points={points:.0f}/12")
+    return points, False
 
 # ─────────────────────────────────────────────
-#  SCORING: FUNDING RATE — 5 pts
+#  SCORING: FUNDING RATE — 4 pts
 # ─────────────────────────────────────────────
 
 def score_funding(
@@ -1456,108 +1406,104 @@ def score_funding(
     direction: str,
 ) -> tuple[float, bool]:
     """
-    LONG : funding < 0 → +5 | > +0.1% → BLOCK
-    SHORT: funding > 0 → +5 | < -0.1% → BLOCK
+    LONG : extreme favor (<-0.05%)=+4 | favorable (<0)=+2 | neutral=+1 | against=0
+           extreme against (>+0.1%) → hard block
+    SHORT: extreme favor (>+0.05%)=+4 | favorable (>0)=+2 | neutral=+1 | against=0
+           extreme against (<-0.1%) → hard block
     Returns (points, blocked).
     """
     try:
         fr_data = exchange.fetch_funding_rate(symbol)
         rate    = float(fr_data.get("fundingRate") or 0)
         if direction == "LONG":
-            if rate >  0.001: return 0.0, True
-            if rate <  0:     return 5.0, False
+            if rate >  0.001:  return 0.0, True     # extreme against → block
+            if rate < -0.0005: return 4.0, False    # extreme favor
+            if rate <  0:      return 2.0, False    # favorable
+            return 1.0, False                        # neutral
         else:
-            if rate < -0.001: return 0.0, True
-            if rate >  0:     return 5.0, False
-        return 0.0, False
+            if rate < -0.001:  return 0.0, True     # extreme against → block
+            if rate >  0.0005: return 4.0, False    # extreme favor
+            if rate >  0:      return 2.0, False    # favorable
+            return 1.0, False                        # neutral
     except Exception as e:
         log.debug(f"Funding rate fetch failed for {symbol}: {e}")
         return 0.0, False
 
 # ─────────────────────────────────────────────
-#  SCORING: RSI CONFIRMING — 5 pts
+#  SCORING: RSI CONFIRMING — 4 pts
 # ─────────────────────────────────────────────
 
 def score_rsi_confirming(closes: list[float], direction: str) -> tuple[float, float, bool]:
     """
-    LONG : RSI 30-60 → +5
-    SHORT: RSI 40-70 → +5
-    RSI > 80 or < 20 → -10 penalty + hard block.
+    Divergence (price new extreme, RSI disagrees) → +4
+    Cross 50 (RSI crossed 50 in right direction last 3 candles)  → +3
+    Trending  (RSI moving in right direction)                     → +2
+    Flat                                                          → 0
+    RSI > 80 or < 20 → hard block (0 pts, blocked=True).
     Returns (points, rsi_value, blocked).
     """
-    rsi = calc_rsi(closes, RSI_PERIOD)
-    if rsi > 80 or rsi < 20:
-        return -10.0, rsi, True
-    if direction == "LONG"  and 30 <= rsi <= 60: return 5.0, rsi, False
-    if direction == "SHORT" and 40 <= rsi <= 70: return 5.0, rsi, False
-    return 0.0, rsi, False
+    if len(closes) < RSI_PERIOD + 6:
+        return 0.0, 50.0, False
+
+    rsi_now   = calc_rsi(closes,       RSI_PERIOD)
+    rsi_prev  = calc_rsi(closes[:-3],  RSI_PERIOD)
+    rsi_older = calc_rsi(closes[:-6],  RSI_PERIOD)
+
+    if rsi_now > 80 or rsi_now < 20:
+        return 0.0, rsi_now, True
+
+    if direction == "LONG":
+        # Bullish divergence: price at new 10-candle low, RSI is not
+        price_new_low = closes[-1] < min(closes[-10:-1])
+        if price_new_low and rsi_now > rsi_prev:
+            return 4.0, rsi_now, False
+        # Cross 50 from below
+        if rsi_prev < 50 <= rsi_now:
+            return 3.0, rsi_now, False
+        # Trending up
+        if rsi_now > rsi_prev > rsi_older and rsi_now >= 45:
+            return 2.0, rsi_now, False
+    else:  # SHORT
+        # Bearish divergence: price at new 10-candle high, RSI is not
+        price_new_high = closes[-1] > max(closes[-10:-1])
+        if price_new_high and rsi_now < rsi_prev:
+            return 4.0, rsi_now, False
+        # Cross 50 from above
+        if rsi_prev > 50 >= rsi_now:
+            return 3.0, rsi_now, False
+        # Trending down
+        if rsi_now < rsi_prev < rsi_older and rsi_now <= 55:
+            return 2.0, rsi_now, False
+
+    return 0.0, rsi_now, False
 
 # ─────────────────────────────────────────────
-#  SCORING: BOTTOM BOUNCE — up to +20 pts (LONG only)
+#  SCORING: CANDLESTICK PATTERN — 7 pts
 # ─────────────────────────────────────────────
 
-def score_bottom_bounce(ohlcv_15m: list) -> tuple[float, bool]:
+def score_candlestick(ohlcv_15m: list, direction: str) -> tuple[float, str]:
     """
-    Awards +20 bonus points for a LONG when ALL 5 conditions are met:
-      1. Price dropped >= 20% in last 48 candles (12h)
-      2. RSI dipped below 30 at some point in last 10 candles (oversold)
-      3. Current price >= 3% above the 10-candle recent low (bounce starting)
-      4. Current candle volume >= 1.5x the 20-candle average (buyers entering)
-      5. EMA7 now > EMA7 three candles ago (turning up)
-
-    Returns (points, bounce_detected).
-      +20, True  — all 5 conditions met
-        0, False — drop < 20% (no check triggered)
-        0, False — drop >= 20% but not all conditions met (no penalty)
+    Very Strong (BullishEngulfing, MorningStar, BearishEngulfing, EveningStar) → 7 pts
+    Strong      (Hammer, ShootingStar, BullPinbar, BearPinbar,
+                 PiercingLine, DarkCloudCover)                                 → 5 pts
+    Moderate    (any other detected pattern)                                   → 3 pts
+    Returns (pts, pattern_name).
     """
-    if len(ohlcv_15m) < 50:
-        return 0.0, False
+    found, name = _detect_candle_pattern(ohlcv_15m, direction)
+    if not found:
+        return 0.0, ""
+    very_strong = {"BullishEngulfing", "MorningStar", "BearishEngulfing", "EveningStar"}
+    strong      = {"Hammer", "ShootingStar", "BullPinbar", "BearPinbar",
+                   "PiercingLine", "DarkCloudCover"}
+    if name in very_strong:
+        return 7.0, name
+    if name in strong:
+        return 5.0, name
+    return 3.0, name
 
-    closes  = [c[4] for c in ohlcv_15m]
-    volumes = [c[5] for c in ohlcv_15m]
-
-    # ── Condition 1: >= 20% drop in last 48 candles
-    window_48  = closes[-49:-1]          # 48 closed candles before current
-    high_48    = max(window_48)
-    price_now  = closes[-1]
-    drop_pct   = (high_48 - price_now) / high_48 if high_48 > 0 else 0.0
-    if drop_pct < 0.20:
-        return 0.0, False               # drop < 20% — bottom bounce not triggered
-
-    # ── Condition 2: RSI below 30 at some point in last 10 candles
-    rsi_oversold = False
-    for i in range(len(closes) - 10, len(closes)):
-        if i < RSI_PERIOD:
-            continue
-        r = calc_rsi(closes[:i + 1], RSI_PERIOD)
-        if r < 30:
-            rsi_oversold = True
-            break
-
-    # ── Condition 3: Current price >= 3% above 10-candle low
-    recent_low   = min(closes[-10:])
-    bounce_pct   = (price_now - recent_low) / recent_low if recent_low > 0 else 0.0
-    bouncing     = bounce_pct >= 0.03
-
-    # ── Condition 4: Current volume >= 1.5x 20-candle average
-    avg_vol_20   = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else 0.0
-    cur_vol      = volumes[-1]
-    vol_surge    = avg_vol_20 > 0 and cur_vol >= avg_vol_20 * 1.5
-
-    # ── Condition 5: EMA7 now > EMA7 three candles ago (turning up)
-    ema7_arr  = calc_ema(closes,       EMA_SHORT)
-    ema7_prev_arr = calc_ema(closes[:-3], EMA_SHORT) if len(closes) > 3 else ema7_arr
-    ema7_now_val  = ema7_arr[-1]      if ema7_arr      else 0.0
-    ema7_prev_val = ema7_prev_arr[-1] if ema7_prev_arr else ema7_now_val
-    ema_turning_up = ema7_now_val > ema7_prev_val
-
-    if rsi_oversold and bouncing and vol_surge and ema_turning_up:
-        return 20.0, True
-
-    return 0.0, False   # drop >= 20% but conditions not all met — no penalty
 
 # ─────────────────────────────────────────────
-#  PHASE 2: COMBINED PATTERN MODULE — up to +15 pts
+#  SCORING: CHART PATTERNS — 8 pts
 # ─────────────────────────────────────────────
 
 def _detect_candle_pattern(ohlcv: list, direction: str) -> tuple[bool, str]:
@@ -1709,39 +1655,82 @@ def _validate_breakout(ohlcv: list, direction: str) -> tuple[bool, float]:
         return (broke and vol_surge and momentum), round(key_level, 8)
 
 
-def score_phase2_pattern(ohlcv_15m: list, direction: str) -> tuple[float, bool, str]:
+def score_chart_patterns(ohlcv_15m: list, direction: str) -> tuple[float, str]:
     """
-    Phase 2 Combined Pattern Module — awards +15 pts only when ALL THREE components agree:
-      Component 1 — Candlestick pattern : reversal / continuation signal aligned with direction.
-      Component 2 — Market structure    : HH+HL series for LONG, LH+LL series for SHORT.
-      Component 3 — Breakout validation : key level broken + volume surge + candle momentum.
-
-    All three must fire simultaneously — no partial credit.
-    Returns (pts, triggered, description).
+    Chart pattern scoring — 8 pts max:
+      Very Strong (8): Phase2 all 3 components (candle+structure+breakout)
+                    OR Bottom Bounce LONG (20% drop, oversold RSI, vol surge, EMA turning)
+      Strong      (6): Market structure + double bottom/top confirmation
+      Moderate    (4): Market structure aligned only
+    Returns (pts, description).
     """
     if len(ohlcv_15m) < 30:
-        return 0.0, False, ""
+        return 0.0, ""
 
     highs = [float(c[2]) for c in ohlcv_15m]
     lows  = [float(c[3]) for c in ohlcv_15m]
 
+    # ── Very Strong: Phase2 (candle + structure + breakout all agree)
     pattern_ok,   pattern_name = _detect_candle_pattern(ohlcv_15m, direction)
     structure_ok, struct_label = _detect_market_structure(highs, lows, direction)
     breakout_ok,  key_level    = _validate_breakout(ohlcv_15m, direction)
 
     log.debug(
-        f"Phase2 [{direction}]: candle={pattern_ok}({pattern_name}) "
+        f"ChartPtn [{direction}]: candle={pattern_ok}({pattern_name}) "
         f"structure={structure_ok}({struct_label}) breakout={breakout_ok}(lvl={key_level})"
     )
 
     if pattern_ok and structure_ok and breakout_ok:
-        desc = f"{pattern_name}+{struct_label}+BO@{key_level}"
-        return 15.0, True, desc
+        desc = f"{pattern_name}+{struct_label}+BO@{key_level:.4f}"
+        return 8.0, desc
 
-    return 0.0, False, ""
+    # ── Very Strong: Bottom Bounce (LONG only — all 5 conditions)
+    if direction == "LONG" and len(ohlcv_15m) >= 50:
+        closes  = [float(c[4]) for c in ohlcv_15m]
+        volumes = [float(c[5]) for c in ohlcv_15m]
+        window_48 = closes[-49:-1]
+        high_48   = max(window_48) if window_48 else 0
+        price_now = closes[-1]
+        drop_pct  = (high_48 - price_now) / high_48 if high_48 > 0 else 0.0
+        if drop_pct >= 0.20:
+            rsi_oversold = False
+            for i in range(len(closes) - 10, len(closes)):
+                if i >= RSI_PERIOD:
+                    r = calc_rsi(closes[:i + 1], RSI_PERIOD)
+                    if r < 30:
+                        rsi_oversold = True
+                        break
+            recent_low  = min(closes[-10:])
+            bounce_pct  = (price_now - recent_low) / recent_low if recent_low > 0 else 0.0
+            avg_vol_20  = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else 0
+            vol_surge   = avg_vol_20 > 0 and volumes[-1] >= avg_vol_20 * 1.5
+            ema7_arr    = calc_ema(closes,       EMA_SHORT)
+            ema7_prev   = calc_ema(closes[:-3],  EMA_SHORT) if len(closes) > 3 else ema7_arr
+            ema_up      = (ema7_arr[-1] if ema7_arr else 0) > (ema7_prev[-1] if ema7_prev else 0)
+            if rsi_oversold and bounce_pct >= 0.03 and vol_surge and ema_up:
+                return 8.0, "Bottom Bounce"
+
+    # ── Strong: Market structure + double bottom/top
+    if structure_ok:
+        double_pattern = False
+        if len(lows) >= 20:
+            if direction == "LONG":
+                sorted_lows = sorted(lows[-20:])
+                if len(sorted_lows) >= 2 and abs(sorted_lows[0] - sorted_lows[1]) / (sorted_lows[0] + 1e-9) < 0.02:
+                    double_pattern = True
+            else:
+                sorted_highs = sorted(highs[-20:], reverse=True)
+                if len(sorted_highs) >= 2 and abs(sorted_highs[0] - sorted_highs[1]) / (sorted_highs[0] + 1e-9) < 0.02:
+                    double_pattern = True
+        if double_pattern:
+            dbl_label = "Double Bottom" if direction == "LONG" else "Double Top"
+            return 6.0, f"{struct_label}+{dbl_label}"
+        return 4.0, struct_label
+
+    return 0.0, ""
 
 # ─────────────────────────────────────────────
-#  PATTERN 1: FIBONACCI RETRACEMENT — up to +20 pts
+#  PATTERN 1: FIBONACCI RETRACEMENT — up to 10 pts
 # ─────────────────────────────────────────────
 
 def score_fibonacci_retracement(
@@ -1751,24 +1740,16 @@ def score_fibonacci_retracement(
     direction: str,
 ) -> tuple[float, str]:
     """
-    Professional Fibonacci confirmation — ALL 5 conditions must pass to award +20 pts:
-
-      1. Price within 1.5% of a key fib level (0.382, 0.500, 0.618, 0.786)
-         from 4H swing high/low over last 50 candles.
-      2. Volume on current 15m candle > 1.2x 20-candle average (reaction at level).
-      3. EMA7 or EMA25 (4H) within 2% of the fib level (structural confluence).
-      4. RSI (15m) in healthy zone — not extreme (25–75 range, 40–70 for LONG, 30–60 for SHORT).
-      5. Price has bounced ≥0.5% from the fib level (not just touching it):
-           LONG  — candle wick low touched level and close is 0.5%+ above it.
-           SHORT — candle wick high touched level and close is 0.5%+ below it.
-
-    Label format: "Fibonacci 0.618 + Volume + EMA Confluence"
-    Returns (pts, label). Returns (0, "") if any condition fails.
+    Tiered Fibonacci scoring — requires RVOL >= 1.2 as gate:
+      0.618 or 0.500 + RVOL>=1.2 + rejection bounce (0.5%) → 10 pts
+      0.382 or 0.786 + RVOL>=1.2 + rejection bounce (0.5%) → 8 pts
+      Any fib level  + RVOL>=1.2 (no rejection required)   → 4 pts
+      RVOL < 1.2                                            → 0 pts
+    Returns (pts, label).
     """
     if len(ohlcv_4h) < 10 or len(ohlcv_15m) < 22 or price_now <= 0:
         return 0.0, ""
 
-    # ── 1. Calculate fib levels from 4H swing high/low
     candles    = ohlcv_4h[-50:] if len(ohlcv_4h) >= 50 else ohlcv_4h
     swing_high = max(float(c[2]) for c in candles)
     swing_low  = min(float(c[3]) for c in candles)
@@ -1782,85 +1763,52 @@ def score_fibonacci_retracement(
         "0.618": swing_low + 0.618 * rng,
         "0.786": swing_low + 0.786 * rng,
     }
+    premium_levels = {"0.618", "0.500"}
 
-    # ── 2. Volume check — current 15m candle vs 20-candle average
-    vols      = [float(c[5]) for c in ohlcv_15m]
-    avg_vol   = sum(vols[-21:-1]) / 20 if len(vols) >= 21 else 0
-    cur_vol   = vols[-1]
-    fib_rvol  = (cur_vol / avg_vol) if avg_vol > 0 else 0.0
+    vols     = [float(c[5]) for c in ohlcv_15m]
+    avg_vol  = sum(vols[-21:-1]) / 20 if len(vols) >= 21 else 0
+    cur_vol  = vols[-1]
+    fib_rvol = (cur_vol / avg_vol) if avg_vol > 0 else 0.0
 
-    # Block 2: Fibonacci requires minimum RVOL of 0.8 — no volume = no confirmation
-    if fib_rvol < 0.8:
-        log.debug(f"Fibonacci blocked — RVOL={fib_rvol:.2f} < 0.8 minimum")
+    if fib_rvol < 1.2:
+        log.debug(f"Fibonacci — RVOL={fib_rvol:.2f} < 1.2 gate")
         return 0.0, ""
 
-    vol_ok    = avg_vol > 0 and cur_vol >= avg_vol * 1.2
-
-    # ── 3. EMA confluence — EMA7 or EMA25 (4H) within 2% of fib level
-    closes_4h = [float(c[4]) for c in ohlcv_4h]
-    ema7_4h   = calc_ema(closes_4h, 7)
-    ema25_4h  = calc_ema(closes_4h, 25)
-    ema7_val  = ema7_4h[-1]  if ema7_4h  else 0.0
-    ema25_val = ema25_4h[-1] if ema25_4h else 0.0
-
-    # ── 4. RSI check — healthy zone, not extreme
-    closes_15m = [float(c[4]) for c in ohlcv_15m]
-    rsi_val    = calc_rsi(closes_15m)
-    if direction == "LONG":
-        rsi_ok = 40 <= rsi_val <= 70   # not overbought, has room to run
-    else:
-        rsi_ok = 30 <= rsi_val <= 60   # not oversold, has room to fall
-
-    # ── 5. Bounce check using last 15m candle wick
     last_c    = ohlcv_15m[-1]
     last_low  = float(last_c[3])
     last_high = float(last_c[2])
 
-    # ── Evaluate each level
+    best_pts   = 0.0
+    best_label = ""
+
     for label, level in levels.items():
         if level <= 0:
             continue
 
-        # Condition 1 — proximity (wick touch within 1.5%)
         if direction == "LONG":
             level_touched = abs(last_low - level) / level <= 0.015
-            bounced       = price_now >= level * 1.005   # 0.5% above level
+            bounced       = price_now >= level * 1.005
         else:
             level_touched = abs(last_high - level) / level <= 0.015
-            bounced       = price_now <= level * 0.995   # 0.5% below level
+            bounced       = price_now <= level * 0.995
 
-        if not level_touched or not bounced:
+        if not level_touched:
             continue
 
-        # Condition 3 — EMA confluence
-        ema_near = (
-            (ema7_val  > 0 and abs(ema7_val  - level) / level <= 0.02) or
-            (ema25_val > 0 and abs(ema25_val - level) / level <= 0.02)
-        )
+        if bounced:
+            pts  = 10.0 if label in premium_levels else 8.0
+            desc = f"Fibonacci {label} + RVOL{fib_rvol:.1f} + Rejection"
+        else:
+            pts  = 4.0
+            desc = f"Fibonacci {label} + RVOL{fib_rvol:.1f}"
 
-        # Build confirmation list
-        confirmations = []
-        if vol_ok:   confirmations.append("Volume")
-        if ema_near: confirmations.append("EMA Confluence")
-        if rsi_ok:   confirmations.append("RSI Healthy")
+        if pts > best_pts:
+            best_pts   = pts
+            best_label = desc
 
-        # All 5 conditions must pass
-        if vol_ok and ema_near and rsi_ok:
-            conf_str  = " + ".join(confirmations)
-            full_label = f"Fibonacci {label} + {conf_str}"
-            log.debug(
-                f"Fib {label} [{direction}]: level={level:.6f} price={price_now:.6f} "
-                f"vol={cur_vol:.0f}/{avg_vol:.0f} ema7={ema7_val:.4f} ema25={ema25_val:.4f} rsi={rsi_val:.1f}"
-            )
-            return 20.0, full_label
-
-        # Partial log — conditions not all met
-        log.debug(
-            f"Fib {label} [{direction}] NEAR but unconfirmed: "
-            f"vol={vol_ok} ema={ema_near} rsi={rsi_ok}({rsi_val:.1f}) bounce={bounced}"
-        )
-
-    return 0.0, ""
+    if best_pts > 0:
+        log.debug(f"Fib [{direction}]: {best_label} +{best_pts:.0f}pts @ price={price_now}")
+    return best_pts, best_label
 
 
 # ─────────────────────────────────────────────
@@ -1943,116 +1891,94 @@ def compute_score(
     direction: str,
 ) -> tuple[float, dict, bool]:
     """
-    Score breakdown (max 100 pts after cap):
-      HTF Trend      25 pts  (1W=15, 1D=10)
-      LTF Align      20 pts  (4H=7, 1H=7, 15m=6)
-      Volume + OI   ~25 pts  (vol=9/12/15, rvol=0–10, oi=10)
-      Market Struct   5 pts
-      Retest         15 pts  (only when coin moved >=15% in 4H)
-      Funding         5 pts
-      RSI             5 pts
-      Bottom Bounce  +20 bonus (LONG only, all 5 conditions)
-      Phase 2        +15 bonus (all 3 components: candle+structure+breakout)
-      Fibonacci      +20/+15 bonus (0.382/0.618=+20, 0.500=+15)
-      OI Analysis    +10/+5 bonus + +5 spike (directional OI confirmation)
-    All bonuses are summed then capped at 100.
+    100-pt scoring framework:
+      HTF Trend        : 20 pts  (1W=10, 1D=10)
+      LTF Alignment    : 15 pts  (4H=5, 1H=5, 15m=5 — ALL 3 required)
+      RVOL             : 12 pts  (>2.0=12, 1.5=9, 1.0=6, 0.5=3, <0.5=block)
+      OI               : 8 pts   (rising+direction=8, flat=3, against=0)
+      Retest           : 12 pts  (staged — only when 4H move >=15%)
+      Fibonacci        : 10 pts  (0.618/0.5+rvol+bounce=10, 0.382/0.786=8, touch=4)
+      Chart Patterns   : 8 pts   (Very Strong=8, Strong=6, Moderate=4)
+      Candlestick      : 7 pts   (Very Strong=7, Strong=5, Moderate=3)
+      RSI              : 4 pts   (divergence=4, cross50=3, trending=2; >80/<20=block)
+      Funding          : 4 pts   (extreme=4, favorable=2, neutral=1; extreme against=block)
+    Total max: 100 pts — capped.
+
+    6-Layer Confluence Counter (position sizing):
+      Layer 1: RVOL >= 1.2
+      Layer 2: OI confirmed (oi_pts >= 8)
+      Layer 3: All 3 LTF aligned
+      Layer 4: Structure confirmed (retest or chart pattern)
+      Layer 5: Fibonacci confirmed (fib_pts > 0)
+      Layer 6: RSI signal (rsi_pts >= 3)
+    Minimum 3/6 to trade | 3=50% size | 4=75% | 5-6=100%
+
     Returns (score, details, blocked).
     """
     details: dict = {"direction": direction, "blocks": []}
     ohlcv_15m  = ohlcv_by_tf.get("15m", [])
     ohlcv_4h   = ohlcv_by_tf.get("4h",  [])
-    closes_15m = [c[4] for c in ohlcv_15m] if ohlcv_15m else []
+    closes_15m = [float(c[4]) for c in ohlcv_15m] if ohlcv_15m else []
     price_now  = closes_15m[-1] if closes_15m else 0.0
     price_prev = closes_15m[-2] if len(closes_15m) >= 2 else price_now
 
-    # ── Volume & OI scoring (3 tiers: >500M=15, 200M–500M=12, <200M=9; no hard skip)
-    vol_pts, rvol_pts, oi_pts, vol_total, skip, rvol_ratio = score_volume_oi(
-        vol_24h, ohlcv_15m, exchange, symbol, direction, price_now, price_prev
+    # ── Volume & OI (RVOL=12 pts, OI=8 pts; RVOL<0.5 = hard block)
+    rvol_pts, oi_pts, vol_total, vol_blocked, rvol_ratio = score_volume_oi(
+        ohlcv_15m, exchange, symbol, direction, price_now, price_prev
     )
-    details["vol_pts"]   = round(vol_pts, 1)
     details["rvol_pts"]  = round(rvol_pts, 1)
     details["oi_pts"]    = round(oi_pts, 1)
     details["rvol_ratio"] = rvol_ratio
 
-    # ── Block 1: Zero/Low Volume — RVOL < 0.8 means no market participation
-    if rvol_ratio < 0.8:
-        details["blocks"].append(f"Zero Volume Block (RVOL={rvol_ratio:.2f})")
-        log.debug(f"Zero Volume Block [{direction}]: RVOL={rvol_ratio:.3f} < 0.8")
+    if vol_blocked:
+        details["blocks"].append(f"Zero Volume Block (RVOL={rvol_ratio:.2f} < 0.5)")
+        log.debug(f"Zero Volume Block [{direction}]: RVOL={rvol_ratio:.3f}")
         return 0.0, details, True
 
-    # ── Retest Detection (15%+ move check — block or bonus)
-    retest_pts, retest_blocked = score_retest_detection(ohlcv_4h, ohlcv_15m, direction)
+    # ── HTF Trend (1W=10, 1D=10 — no hard block)
+    htf_pts, _ = score_htf_trend(ohlcv_by_tf, direction)
+    details["htf_pts"] = round(htf_pts, 1)
+
+    # ── LTF Alignment (4H+1H+15m — ALL 3 required, hard block if <3)
+    ltf_pts, ltf_aligned, trend_confirmed = score_ltf_alignment(ohlcv_by_tf, direction)
+    details["ltf_pts"]     = round(ltf_pts, 1)
+    details["ltf_aligned"] = ltf_aligned
+    if not trend_confirmed:
+        details["blocks"].append(f"LTF Trend Block ({ltf_aligned}/3 aligned)")
+        return 0.0, details, True
+
+    # ── Retest Detection (staged 12 pts — never blocks)
+    retest_pts, _ = score_retest_detection(ohlcv_4h, ohlcv_15m, direction)
     details["retest_pts"] = round(retest_pts, 1)
-    if retest_blocked:
-        details["blocks"].append("coin_15pct_move_retest_not_confirmed")
-        return 0.0, details, True
+    if retest_pts > 0:
+        details.setdefault("entry_reasons", []).append(f"Retest +{retest_pts:.0f}")
 
-    # ── Bottom Bounce (LONG only — +20 bonus if all 5 conditions met)
-    #    When confirmed: bypasses 1D EMA hard block.
-    #    Counter-trend by design — bearish market context is intentionally ignored.
-    bounce_pts     = 0.0
-    bounce_detected = False
-    if direction == "LONG":
-        bounce_pts, bounce_detected = score_bottom_bounce(ohlcv_15m)
-        details["bounce_pts"] = round(bounce_pts, 1)
-        if bounce_detected:
-            details.setdefault("entry_reasons", []).append("Bottom Bounce +20")
-            log.info(f"Bottom Bounce confirmed — 1D EMA hard block bypassed for LONG.")
-    else:
-        details["bounce_pts"] = 0.0
-
-    # ── Phase 2: Combined Pattern Module (+15 if candlestick + structure + breakout all agree)
-    phase2_pts, phase2_triggered, phase2_desc = score_phase2_pattern(ohlcv_15m, direction)
-    details["phase2_pts"] = round(phase2_pts, 1)
-    if phase2_triggered:
-        details.setdefault("entry_reasons", []).append(f"Phase2: {phase2_desc}")
-
-    # ── Fibonacci Retracement (Pattern 1 — up to +20 pts, all 5 conditions required)
+    # ── Fibonacci (tiered 10/8/4 pts — RVOL>=1.2 gate inside)
     fib_pts, fib_label = score_fibonacci_retracement(ohlcv_4h, ohlcv_15m, price_now, direction)
     details["fib_pts"] = round(fib_pts, 1)
     if fib_label:
         details.setdefault("entry_reasons", []).append(fib_label)
-        log.debug(f"Fibonacci [{direction}]: {fib_label} +{fib_pts:.0f}pts @ price={price_now}")
 
-    # ── OI Analysis (Pattern 2 — up to +15 pts)
-    oi_analysis_pts, oi_reasons = score_oi_analysis(
-        exchange, symbol, direction, price_now, price_prev
-    )
-    details["oi_analysis_pts"] = round(oi_analysis_pts, 1)
-    for r in oi_reasons:
-        details.setdefault("entry_reasons", []).append(r)
-    if oi_reasons:
-        log.debug(f"OI Analysis [{direction}]: {', '.join(oi_reasons)} +{oi_analysis_pts:.0f}pts")
+    # ── Chart Patterns (8 pts tiered)
+    chart_pts, chart_desc = score_chart_patterns(ohlcv_15m, direction)
+    details["chart_pts"] = round(chart_pts, 1)
+    if chart_desc:
+        details.setdefault("entry_reasons", []).append(f"ChartPtn: {chart_desc}")
 
-    # ── HTF Trend (1W + 1D) — 1D hard block bypassed when Bottom Bounce confirmed for LONG
-    htf_pts, htf_blocked = score_htf_trend(ohlcv_by_tf, direction)
-    details["htf_pts"] = round(htf_pts, 1)
-    if htf_blocked:
-        if direction == "LONG" and bounce_detected:
-            log.info(f"1D EMA hard block bypassed — Bottom Bounce confirmed for LONG.")
-        else:
-            details["blocks"].append("1D_strongly_opposing")
-            return 0.0, details, True
+    # ── Candlestick (7 pts tiered)
+    candle_pts, candle_name = score_candlestick(ohlcv_15m, direction)
+    details["candle_pts"] = round(candle_pts, 1)
+    if candle_name:
+        details.setdefault("entry_reasons", []).append(f"Candle: {candle_name}")
 
-    # ── LTF Alignment (1D filter + 4H + 1H + 15m — 3 of 4 required)
-    ltf_pts, ltf_aligned, trend_confirmed = score_ltf_alignment(ohlcv_by_tf, direction)
-    details["ltf_pts"]     = round(ltf_pts, 1)
-    details["ltf_aligned"] = ltf_aligned
-
-    # ── Market Structure Bonus (+5 pts when HH+HL or LH+LL confirmed)
-    struct_pts, struct_aligned = score_market_structure_bonus(ohlcv_15m, direction)
-    details["struct_pts"] = round(struct_pts, 1)
-    if struct_aligned:
-        details.setdefault("entry_reasons", []).append("Market Structure Aligned +5")
-
-    # ── Funding Rate
+    # ── Funding Rate (4 pts tiered — extreme against = hard block)
     fund_pts, fund_blocked = score_funding(exchange, symbol, direction)
     details["fund_pts"] = round(fund_pts, 1)
     if fund_blocked:
-        details["blocks"].append("funding_extreme")
+        details["blocks"].append("funding_extreme_against")
         return 0.0, details, True
 
-    # ── RSI Confirming (5 pts, -10 if extreme)
+    # ── RSI (4 pts tiered — >80/<20 = hard block)
     rsi_pts, rsi_val, rsi_blocked = score_rsi_confirming(closes_15m, direction)
     details["rsi"]     = round(rsi_val, 2)
     details["rsi_pts"] = round(rsi_pts, 1)
@@ -2060,47 +1986,58 @@ def compute_score(
         details["blocks"].append(f"RSI_extreme_{rsi_val:.1f}")
         return 0.0, details, True
 
-    # ── 4-Confirmation Gate — require minimum 3 of 4:
-    #   TREND     : 3+ of (1D, 4H, 1H, 15m) EMA aligned with direction
-    #   VOLUME    : RVOL >= 1.0 (active participation — not just > 0.8 pass-through)
-    #   STRUCTURE : at least one pattern fired (retest / phase2 / bounce / market structure)
-    #   MOMENTUM  : RSI in healthy zone (not penalised)
-    vol_confirmed      = rvol_ratio >= 1.0
-    struct_confirmed   = (retest_pts > 0 or phase2_pts > 0 or bounce_pts > 0 or struct_pts > 0)
-    momentum_confirmed = rsi_pts >= 0
+    # ── 6-Layer Confluence Counter
+    layer1_vol     = rvol_ratio >= 1.2
+    layer2_oi      = oi_pts >= 8.0
+    layer3_trend   = trend_confirmed                         # all 3 LTF (already gated above)
+    layer4_struct  = (retest_pts > 0 or chart_pts > 0)
+    layer5_fib     = fib_pts > 0
+    layer6_rsi     = rsi_pts >= 3
 
     conf_map = {
-        "Trend":     trend_confirmed,
-        "Volume":    vol_confirmed,
-        "Structure": struct_confirmed,
-        "Momentum":  momentum_confirmed,
+        "Volume":    layer1_vol,
+        "OI":        layer2_oi,
+        "Trend":     layer3_trend,
+        "Structure": layer4_struct,
+        "Fibonacci": layer5_fib,
+        "RSI":       layer6_rsi,
     }
-    confirmed_count = sum(conf_map.values())
-    confirmed_names = [k for k, v in conf_map.items() if v]
-    missing_names   = [k for k, v in conf_map.items() if not v]
-    details["confirmations"]  = confirmed_count
-    details["conf_confirmed"] = ", ".join(confirmed_names)
+    confluence_count  = sum(conf_map.values())
+    confluence_names  = [k for k, v in conf_map.items() if v]
+    missing_names     = [k for k, v in conf_map.items() if not v]
+    details["confluence"]       = confluence_count
+    details["conf_confirmed"]   = ", ".join(confluence_names)
+    details["ltf_aligned"]      = ltf_aligned
 
     log.debug(
-        f"4-Conf [{direction}] {confirmed_count}/4 — "
-        f"trend={trend_confirmed}({ltf_aligned}/4) vol={vol_confirmed}({rvol_ratio:.2f}) "
-        f"struct={struct_confirmed} momentum={momentum_confirmed}"
+        f"Confluence [{direction}] {confluence_count}/6 — "
+        f"{', '.join(confluence_names)} | missing: {', '.join(missing_names)}"
     )
 
-    if confirmed_count < 3:
+    if confluence_count < 3:
         details["blocks"].append(
-            f"Only {confirmed_count}/4 Confirmations — missing: {', '.join(missing_names)}"
+            f"Confluence {confluence_count}/6 — need 3 min | missing: {', '.join(missing_names)}"
         )
         return 0.0, details, True
 
-    total = (htf_pts + ltf_pts + vol_total + struct_pts + retest_pts + fund_pts + rsi_pts
-             + bounce_pts + phase2_pts + fib_pts + oi_analysis_pts)
-    total = max(0.0, min(100.0, total))   # cap at 100 — bonus components push score up, normalized here
+    # ── Position size multiplier based on confluence
+    if confluence_count >= 5:
+        size_mult = 1.00
+    elif confluence_count == 4:
+        size_mult = 0.75
+    else:
+        size_mult = 0.50
+    details["size_mult"]       = size_mult
+    details["confluence_count"] = confluence_count
+
+    total = (htf_pts + ltf_pts + rvol_pts + oi_pts + retest_pts
+             + fib_pts + chart_pts + candle_pts + fund_pts + rsi_pts)
+    total = max(0.0, min(100.0, total))
 
     details["price"] = round(price_now, 8)
     details["total"] = round(total, 1)
 
-    # ── Entry Candle Quality (final gate — blocks trade if candle structure is weak)
+    # ── Entry Candle Quality (final gate)
     candle_ok, candle_fail_reason = check_entry_candle_quality(ohlcv_15m, direction)
     if not candle_ok:
         details["blocks"].append(f"Weak Entry Candle: {candle_fail_reason}")
@@ -2118,38 +2055,33 @@ def call_claude(symbol: str, details: dict, direction: str) -> tuple[float, str]
     api_key = os.getenv("ANTHROPIC_API_KEY") or CLAUDE_API_KEY
     client = anthropic.Anthropic(api_key=api_key)
 
-    retest_label      = f"CONFIRMED +{details.get('retest_pts', 0)}" if details.get("retest_pts", 0) > 0 else "n/a"
-    phase2_label      = f"TRIGGERED +{details.get('phase2_pts', 0)}" if details.get("phase2_pts", 0) > 0 else "n/a"
-    fib_reasons       = [r for r in details.get("entry_reasons", []) if r.startswith("Fibonacci")]
-    fib_label         = f"TRIGGERED {fib_reasons[0]} +{details.get('fib_pts', 0)}" if fib_reasons else "n/a"
-    oi_reasons_list   = [r for r in details.get("entry_reasons", [])
-                         if r in ("OI Bullish Confirmation","OI Bearish Confirmation",
-                                  "Short Squeeze","Long Liquidation","OI Spike Detected")]
-    oi_analysis_label = (f"TRIGGERED {', '.join(oi_reasons_list)} +{details.get('oi_analysis_pts', 0)}"
-                         if oi_reasons_list else "n/a")
+    fib_label    = next((r for r in details.get("entry_reasons", []) if r.startswith("Fibonacci")), "n/a")
+    chart_label  = next((r for r in details.get("entry_reasons", []) if r.startswith("ChartPtn")), "n/a")
+    candle_label = next((r for r in details.get("entry_reasons", []) if r.startswith("Candle")), "n/a")
+    retest_label = next((r for r in details.get("entry_reasons", []) if r.startswith("Retest")), "n/a")
+    size_pct     = int(details.get("size_mult", 1.0) * 100)
     prompt = f"""You are MUESA, a professional crypto futures trading AI.
 
 Review this signal for {symbol} on Binance Futures — {direction}.
 
-Score breakdown:
-  HTF Trend (1W+1D)     : {details.get('htf_pts', 0)} / 25
-  Trend Align ({details.get('ltf_aligned', 0)}/4 TF)    : {details.get('ltf_pts', 0)} / 20
-  Confirmations         : {details.get('conf_confirmed', '—')} ({details.get('confirmations', 0)}/4)
-  Volume                : {details.get('vol_pts', 0)} / 15
-  RVOL                  : {details.get('rvol_pts', 0)} / 10
-  Open Interest (basic) : {details.get('oi_pts', 0)} / 10
-  Market Structure      : {details.get('struct_pts', 0)} / 5
-  Retest Detection      : {retest_label} / 15
-  Funding Rate          : {details.get('fund_pts', 0)} / 5
-  RSI ({details.get('rsi', 'N/A')})              : {details.get('rsi_pts', 0)} / 5
-  Phase 2 Pattern       : {phase2_label} / 15
-  Fibonacci (confirmed) : {fib_label} / 20
-  OI Analysis           : {oi_analysis_label} / 15
-  Base total            : {details.get('total', 0)} / 100
-  Price                 : {details.get('price', 'N/A')}
-  Direction             : {direction}
+Score breakdown (100 pts system):
+  HTF Trend (1W+1D)    : {details.get('htf_pts', 0)} / 20
+  LTF Align ({details.get('ltf_aligned', 0)}/3 TF)    : {details.get('ltf_pts', 0)} / 15
+  Confluence           : {details.get('conf_confirmed', '—')} ({details.get('confluence', 0)}/6)
+  RVOL                 : {details.get('rvol_pts', 0)} / 12
+  Open Interest        : {details.get('oi_pts', 0)} / 8
+  Retest (staged)      : {retest_label} / 12
+  Fibonacci            : {fib_label} / 10
+  Chart Pattern        : {chart_label} / 8
+  Candlestick          : {candle_label} / 7
+  Funding Rate         : {details.get('fund_pts', 0)} / 4
+  RSI ({details.get('rsi', 'N/A')})             : {details.get('rsi_pts', 0)} / 4
+  Base total           : {details.get('total', 0)} / 100
+  Position size        : {size_pct}% of allocation
+  Price                : {details.get('price', 'N/A')}
+  Direction            : {direction}
 
-Be conservative. Penalise weak HTF trend or poor LTF alignment.
+Be conservative. Penalise weak HTF trend, poor LTF alignment, or low confluence.
 Return ONLY this JSON (no markdown):
 {{"score": <integer 0-100>, "rationale": "<max 20 words>"}}"""
 
@@ -2178,11 +2110,15 @@ Return ONLY this JSON (no markdown):
 #  POSITION SIZING
 # ─────────────────────────────────────────────
 
-def get_position_size(exchange: ccxt.binanceusdm, symbol: str, price: float) -> float:
+def get_position_size(exchange: ccxt.binanceusdm, symbol: str, price: float,
+                      size_mult: float = 1.0) -> float:
+    """
+    size_mult: 0.50 (3/6 confluence) | 0.75 (4/6) | 1.00 (5-6/6).
+    """
     try:
         balance   = exchange.fetch_balance()
         usdt_free = float(balance["USDT"]["free"])
-        notional  = usdt_free * WALLET_ALLOC_PCT * LEVERAGE
+        notional  = usdt_free * WALLET_ALLOC_PCT * size_mult * LEVERAGE
         qty       = notional / price
         market    = exchange.market(symbol)
         step      = float(market.get("precision", {}).get("amount", 0.001))
@@ -2232,18 +2168,18 @@ def _build_trade_alert(
         f"TP2     : `{tp2}` ({tp2_side})\n"
         f"─────────────────────\n"
         f"*Score Breakdown ({final_score}/100)*\n"
-        f"HTF Trend   : `{details.get('htf_pts', 0)}` / 25\n"
-        f"Trend Align : `{details.get('ltf_pts', 0)}` / 20  ({details.get('ltf_aligned', 0)}/4 TF)\n"
-        f"Confirmed   : `{details.get('conf_confirmed', '—')}` ({details.get('confirmations', 0)}/4)\n"
-        f"Volume      : `{details.get('vol_pts', 0)}` + RVOL `{details.get('rvol_pts', 0)}`\n"
-        f"OI (basic)  : `{details.get('oi_pts', 0)}` / 10\n"
-        f"Mkt Struct  : `{details.get('struct_pts', 0)}` / 5\n"
-        f"Retest      : `{details.get('retest_pts', 0)}` / 15\n"
-        f"Funding     : `{details.get('fund_pts', 0)}`\n"
-        f"RSI ({details.get('rsi','?')})   : `{details.get('rsi_pts', 0)}`\n"
-        f"Phase2 Ptn  : `{details.get('phase2_pts', 0)}` / 15\n"
-        f"Fibonacci   : `{details.get('fib_pts', 0)}` / 20 (all 5 conditions)\n"
-        f"OI Analysis : `{details.get('oi_analysis_pts', 0)}` / 15\n"
+        f"HTF Trend    : `{details.get('htf_pts', 0)}` / 20\n"
+        f"LTF Align    : `{details.get('ltf_pts', 0)}` / 15  ({details.get('ltf_aligned', 0)}/3 TF)\n"
+        f"Confluence   : `{details.get('conf_confirmed', '—')}` ({details.get('confluence', 0)}/6)\n"
+        f"RVOL         : `{details.get('rvol_pts', 0)}` / 12  (x{details.get('rvol_ratio', 0):.2f})\n"
+        f"OI           : `{details.get('oi_pts', 0)}` / 8\n"
+        f"Retest       : `{details.get('retest_pts', 0)}` / 12\n"
+        f"Fibonacci    : `{details.get('fib_pts', 0)}` / 10\n"
+        f"Chart Ptn    : `{details.get('chart_pts', 0)}` / 8\n"
+        f"Candlestick  : `{details.get('candle_pts', 0)}` / 7\n"
+        f"Funding      : `{details.get('fund_pts', 0)}` / 4\n"
+        f"RSI ({details.get('rsi','?')})    : `{details.get('rsi_pts', 0)}` / 4\n"
+        f"Size         : `{int(details.get('size_mult', 1.0) * 100)}%` of allocation\n"
         f"─────────────────────\n"
         f"Patterns    : _{', '.join(details.get('entry_reasons', [])) or 'None'}_\n"
         f"─────────────────────\n"
@@ -2260,7 +2196,8 @@ def open_long(
     session: str,
 ) -> bool:
     """Returns True if trade was successfully opened."""
-    qty = get_position_size(exchange, symbol, price)
+    size_mult = details.get("size_mult", 1.0)
+    qty = get_position_size(exchange, symbol, price, size_mult)
     if qty <= 0:
         log.warning(f"Invalid qty for {symbol}, skipping.")
         return False
@@ -2330,7 +2267,8 @@ def open_short(
     session: str,
 ) -> bool:
     """Returns True if trade was successfully opened."""
-    qty = get_position_size(exchange, symbol, price)
+    size_mult = details.get("size_mult", 1.0)
+    qty = get_position_size(exchange, symbol, price, size_mult)
     if qty <= 0:
         log.warning(f"Invalid qty for {symbol}, skipping.")
         return False
