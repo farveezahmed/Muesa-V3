@@ -32,9 +32,11 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 CLAUDE_MODEL         = "claude-haiku-4-5-20251001"
 SCAN_INTERVAL_MIN    = 5              # scan every 5 min (still uses 15m candle data)
-MIN_USDT_VOLUME      = 200_000_000   # volume scoring tier boundary (NOT a filter)
-HIGH_USDT_VOLUME     = 500_000_000   # tier-1 volume threshold
-TOP_N_COINS          = 100
+VOLUME_FLOOR_USDT    = 50_000_000    # absolute minimum 24h volume — coins below ignored
+VOLUME_MID_USDT      = 150_000_000   # mid-tier volume for scoring
+VOLUME_HIGH_USDT     = 300_000_000   # high-tier volume for scoring
+SKIP_TOP_N_COINS     = 50            # skip rank 1-50 (mega-caps — too slow for alpha)
+SCAN_BAND_SIZE       = 150           # scan coins ranked 51-200 by volume
 MAX_OPEN_POSITIONS   = 1             # hard block if 1 already open
 MAX_WATCHLIST        = 5             # maximum watchlist slots
 WALLET_ALLOC_PCT     = 0.25
@@ -1180,12 +1182,21 @@ def score_volume_oi(
     direction: str,
     price_now: float,
     price_prev: float,
-) -> tuple[float, float, float, bool, float]:
+    vol_24h: float = 0.0,
+) -> tuple[float, float, float, float, bool, float]:
     """
-    RVOL: >2.0=12, 1.5-2.0=9, 1.0-1.5=6, 0.5-1.0=3, <0.5=hard block.
-    OI  : rising+direction=8, flat (<0.1% change)=3, falling/against=0.
-    Returns (rvol_pts, oi_pts, total, blocked, rvol_ratio).
+    24h Volume (8 pts): >=300M=8, >=150M=5, >=50M(floor)=2.
+    RVOL      (12 pts): >2.0=12, 1.5=9, 1.0=6, 0.5=3, <0.5=hard block.
+    OI         (8 pts): rising+direction=8, flat=3, against=0.
+    Returns (vol_pts, rvol_pts, oi_pts, total, blocked, rvol_ratio).
     """
+    # ── 24h volume tier (based on absolute floor and scoring bands)
+    if   vol_24h >= VOLUME_HIGH_USDT: vol_pts = 8.0   # >= $300M
+    elif vol_24h >= VOLUME_MID_USDT:  vol_pts = 5.0   # >= $150M
+    elif vol_24h >= VOLUME_FLOOR_USDT: vol_pts = 2.0  # >= $50M (floor, low score)
+    else:                              vol_pts = 0.0
+
+    # ── RVOL (relative volume vs 20-bar candle avg)
     rvol_pts   = 0.0
     rvol_ratio = 0.0
     blocked    = False
@@ -1205,6 +1216,7 @@ def score_volume_oi(
     if rvol_ratio < 0.5:
         blocked = True
 
+    # ── OI (open interest direction)
     oi_pts = 0.0
     try:
         history = exchange.fetch_open_interest_history(symbol, "15m", limit=3)
@@ -1225,8 +1237,8 @@ def score_volume_oi(
     except Exception as e:
         log.debug(f"OI fetch failed for {symbol}: {e}")
 
-    total = rvol_pts + oi_pts
-    return rvol_pts, oi_pts, total, blocked, rvol_ratio
+    total = vol_pts + rvol_pts + oi_pts
+    return vol_pts, rvol_pts, oi_pts, total, blocked, rvol_ratio
 
 # ─────────────────────────────────────────────
 #  SCORING: MARKET STRUCTURE BONUS — 5 pts
@@ -1973,10 +1985,12 @@ def compute_score(
     price_now  = closes_15m[-1] if closes_15m else 0.0
     price_prev = closes_15m[-2] if len(closes_15m) >= 2 else price_now
 
-    # ── Volume & OI (RVOL=12 pts, OI=8 pts; RVOL<0.5 = hard block)
-    rvol_pts, oi_pts, vol_total, vol_blocked, rvol_ratio = score_volume_oi(
-        ohlcv_15m, exchange, symbol, direction, price_now, price_prev
+    # ── Volume & OI (24h vol=8 pts, RVOL=12 pts, OI=8 pts; RVOL<0.5 = hard block)
+    vol_pts, rvol_pts, oi_pts, vol_total, vol_blocked, rvol_ratio = score_volume_oi(
+        ohlcv_15m, exchange, symbol, direction, price_now, price_prev, vol_24h
     )
+    details["vol_24h"]   = vol_24h
+    details["vol_pts"]   = round(vol_pts, 1)
     details["rvol_pts"]  = round(rvol_pts, 1)
     details["oi_pts"]    = round(oi_pts, 1)
     details["rvol_ratio"] = rvol_ratio
@@ -2081,7 +2095,7 @@ def compute_score(
     details["size_mult"]       = size_mult
     details["confluence_count"] = confluence_count
 
-    total = (htf_pts + ltf_pts + rvol_pts + oi_pts + retest_pts
+    total = (htf_pts + ltf_pts + vol_pts + rvol_pts + oi_pts + retest_pts
              + fib_pts + structure_pts + candle_pts + fund_pts + rsi_pts)
     total = max(0.0, min(100.0, total))
 
@@ -2119,6 +2133,7 @@ Score breakdown (100 pts system):
   HTF Trend (1W+1D)    : {details.get('htf_pts', 0)} / 20
   LTF Align ({details.get('ltf_aligned', 0)}/3 TF)    : {details.get('ltf_pts', 0)} / 15
   Confluence           : {details.get('conf_confirmed', '—')} ({details.get('confluence', 0)}/6)
+  24h Volume           : {details.get('vol_pts', 0)} / 8   (${details.get('vol_24h', 0)/1e6:.0f}M)
   RVOL                 : {details.get('rvol_pts', 0)} / 12
   Open Interest        : {details.get('oi_pts', 0)} / 8
   Retest (staged)      : {retest_label} / 12
@@ -2222,6 +2237,7 @@ def _build_trade_alert(
         f"HTF Trend    : `{details.get('htf_pts', 0)}` / 20\n"
         f"LTF Align    : `{details.get('ltf_pts', 0)}` / 15  ({details.get('ltf_aligned', 0)}/3 TF)\n"
         f"Confluence   : `{details.get('conf_confirmed', '—')}` ({details.get('confluence', 0)}/6)\n"
+        f"24h Volume   : `{details.get('vol_pts', 0)}` / 8  (${details.get('vol_24h', 0)/1e6:.0f}M)\n"
         f"RVOL         : `{details.get('rvol_pts', 0)}` / 12  (x{details.get('rvol_ratio', 0):.2f})\n"
         f"OI           : `{details.get('oi_pts', 0)}` / 8\n"
         f"Retest       : `{details.get('retest_pts', 0)}` / 12\n"
@@ -2477,20 +2493,34 @@ def sync_open_positions(exchange: ccxt.binanceusdm) -> None:
 # ─────────────────────────────────────────────
 
 def get_top_symbols(exchange: ccxt.binanceusdm) -> list[tuple[str, float]]:
-    """Return top N [(symbol, vol_24h)] sorted by 24h USDT volume descending.
-    Fetches ALL Binance futures USDT-M perpetuals — no minimum volume filter.
-    Binance futures symbols are formatted as BASE/USDT:USDT (perpetuals only).
+    """
+    Returns [(symbol, vol_24h)] for the scan band — coins ranked 51-200 by volume.
+
+    Rules:
+      1. Volume floor: 24h volume < VOLUME_FLOOR_USDT ($50M) → excluded (too illiquid).
+      2. Skip top 50: rank 1-50 by volume skipped (mega-caps, too slow for alpha).
+      3. Scan band: next SCAN_BAND_SIZE coins (rank 51-200).
+
+    This targets mid-cap futures coins with real liquidity but still enough
+    volatility to produce high-quality breakout setups.
     """
     try:
         tickers    = exchange.fetch_tickers()
         usdt_pairs = [
             (sym, float(t.get("quoteVolume") or 0))
             for sym, t in tickers.items()
-            if sym.endswith("/USDT:USDT")   # perpetual futures format
+            if sym.endswith("/USDT:USDT")
         ]
-        sorted_pairs = sorted(usdt_pairs, key=lambda x: x[1], reverse=True)
-        result       = sorted_pairs[:TOP_N_COINS]
-        log.info(f"Top {len(result)} coins by volume fetched (total USDT pairs: {len(usdt_pairs)})")
+        # Apply absolute volume floor
+        qualified = [(sym, vol) for sym, vol in usdt_pairs if vol >= VOLUME_FLOOR_USDT]
+        sorted_pairs = sorted(qualified, key=lambda x: x[1], reverse=True)
+        # Skip top 50, take next SCAN_BAND_SIZE (rank 51-200)
+        result = sorted_pairs[SKIP_TOP_N_COINS : SKIP_TOP_N_COINS + SCAN_BAND_SIZE]
+        log.info(
+            f"Scan band: rank {SKIP_TOP_N_COINS+1}-{SKIP_TOP_N_COINS+len(result)} "
+            f"| {len(result)} coins | floor=${VOLUME_FLOOR_USDT/1e6:.0f}M "
+            f"| total qualified: {len(qualified)}"
+        )
         return result
     except Exception as e:
         log.error(f"Failed to fetch tickers: {e}")
