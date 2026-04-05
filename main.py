@@ -1197,6 +1197,7 @@ def score_volume_oi(
     else:                              vol_pts = 0.0
 
     # ── RVOL (relative volume vs 20-bar candle avg)
+    # Hard block when RVOL < 0.5 — no negative scoring, just skip entirely.
     rvol_pts   = 0.0
     rvol_ratio = 0.0
     blocked    = False
@@ -1211,10 +1212,13 @@ def score_volume_oi(
             elif rvol >= 1.5: rvol_pts = 9.0
             elif rvol >= 1.0: rvol_pts = 6.0
             elif rvol >= 0.5: rvol_pts = 3.0
-            else:             blocked  = True
+            else:
+                rvol_pts = 0.0   # FIX 1: no negative scoring — hard block below
+                blocked  = True
 
     if rvol_ratio < 0.5:
-        blocked = True
+        blocked  = True
+        rvol_pts = 0.0   # guarantee no negative value reaches the total
 
     # ── OI (open interest direction)
     oi_pts = 0.0
@@ -1326,6 +1330,48 @@ def check_entry_candle_quality(ohlcv_15m: list, direction: str) -> tuple[bool, s
             return False, f"close in upper range ({close_pos:.0%})"
 
     return True, ""
+
+
+def _check_entry_candle_strict(ohlcv_15m: list, direction: str) -> tuple[bool, str]:
+    """
+    FIX 3 — Strict entry candle filter applied BEFORE order execution.
+    Checks the last fully closed 15m candle (ohlcv_15m[-2]).
+
+    LONG  : close > open  |  body >= 60% of range  |  close in top 30%
+    SHORT : close < open  |  body >= 60% of range  |  close in bottom 30%
+
+    Returns (passed, reason_if_failed).
+    """
+    if len(ohlcv_15m) < 2:
+        return False, "insufficient candle data"
+
+    c   = ohlcv_15m[-2]          # last fully closed candle
+    o   = float(c[1]); h = float(c[2])
+    l   = float(c[3]); cl = float(c[4])
+    rng = h - l
+
+    if rng <= 0:
+        return False, "zero range candle"
+
+    body      = abs(cl - o) / rng
+    close_pos = (cl - l)   / rng   # 0 = at low, 1 = at high
+
+    if body < 0.60:
+        return False, f"body {body:.0%} < 60% (weak candle)"
+
+    if direction == "LONG":
+        if cl <= o:
+            return False, "candle not bullish (close <= open)"
+        if close_pos < 0.70:          # close must be in top 30%
+            return False, f"close at {close_pos:.0%} of range (need >= 70%)"
+    else:  # SHORT
+        if cl >= o:
+            return False, "candle not bearish (close >= open)"
+        if close_pos > 0.30:          # close must be in bottom 30%
+            return False, f"close at {close_pos:.0%} of range (need <= 30%)"
+
+    return True, ""
+
 
 # ─────────────────────────────────────────────
 #  SCORING: RETEST DETECTION — 12 pts staged
@@ -1665,6 +1711,84 @@ def _validate_breakout(ohlcv: list, direction: str) -> tuple[bool, float]:
         broke     = cur_c < key_level
         momentum  = (cur_h - cur_c) / cur_range >= 0.60    # close in lower 40% of range
         return (broke and vol_surge and momentum), round(key_level, 8)
+
+
+# ─────────────────────────────────────────────
+#  BASE BREAKOUT DETECTOR — bool helper
+# ─────────────────────────────────────────────
+
+def _detect_base_breakout(ohlcv: list, direction: str) -> tuple[bool, str]:
+    """
+    Simple 4-step base breakout detector — returns (True, desc) or (False, "").
+    Used in compute_score for a flat +15 pts bonus when detected.
+    (Separate from score_structure_breakout which does quality-tiered scoring.)
+
+    Steps (all required):
+      1. BASE      : 12+ candles sideways, range < 5% of avg price
+      2. VOL EXPL  : breakout candle RVOL >= 2.5x base avg volume
+      3. BREAKOUT  : close above base_high (LONG) / below base_low (SHORT)
+      4. MOMENTUM  : body >= 50%, close in top/bottom 30%
+
+    Searches breakout candle at offsets 3-8 from current candle.
+    """
+    n = len(ohlcv)
+    if n < 30:
+        return False, ""
+
+    for offset in range(3, 9):
+        if n - offset < 22:
+            break
+
+        bo_c         = ohlcv[-offset]
+        base_candles = ohlcv[-(offset + 20):-offset]
+        if len(base_candles) < 12:
+            continue
+
+        b_highs  = [float(c[2]) for c in base_candles]
+        b_lows   = [float(c[3]) for c in base_candles]
+        b_closes = [float(c[4]) for c in base_candles]
+        b_vols   = [float(c[5]) for c in base_candles]
+
+        base_high = max(b_highs);  base_low  = min(b_lows)
+        avg_price = sum(b_closes) / len(b_closes)
+        avg_vol   = sum(b_vols)   / len(b_vols)
+        if avg_price <= 0 or avg_vol <= 0:
+            continue
+
+        # Step 1: Tight base
+        rng_pct = (base_high - base_low) / avg_price
+        if rng_pct > 0.05:
+            continue
+
+        bo_open  = float(bo_c[1]); bo_high = float(bo_c[2])
+        bo_low   = float(bo_c[3]); bo_close = float(bo_c[4])
+        bo_range = bo_high - bo_low
+        if bo_range <= 0:
+            continue
+
+        # Step 2: Volume explosion
+        bo_rvol = float(bo_c[5]) / avg_vol
+        if bo_rvol < 2.5:
+            continue
+
+        body_ratio = abs(bo_close - bo_open) / bo_range
+
+        if direction == "LONG":
+            if bo_close <= base_high:        # Step 3: breakout
+                continue
+            close_pos = (bo_close - bo_low) / bo_range
+            if body_ratio < 0.50 or close_pos < 0.70:   # Step 4: momentum
+                continue
+            return True, f"Base({rng_pct:.1%})+VolEx(x{bo_rvol:.1f})+BO+Momentum"
+        else:
+            if bo_close >= base_low:
+                continue
+            close_pos = (bo_high - bo_close) / bo_range
+            if body_ratio < 0.50 or close_pos < 0.70:
+                continue
+            return True, f"Base({rng_pct:.1%})+VolEx(x{bo_rvol:.1f})+BD+Momentum"
+
+    return False, ""
 
 
 # ─────────────────────────────────────────────
@@ -2030,6 +2154,15 @@ def compute_score(
     if structure_desc:
         details.setdefault("entry_reasons", []).append(f"Structure: {structure_desc}")
 
+    # ── FIX 2: Base Breakout flat +15 bonus (uses _detect_base_breakout helper)
+    base_bo_pts = 0.0
+    base_bo_ok, base_bo_desc = _detect_base_breakout(ohlcv_15m, direction)
+    if base_bo_ok:
+        base_bo_pts = 15.0
+        details.setdefault("entry_reasons", []).append(f"BaseBO: {base_bo_desc}")
+        log.info(f"Base Breakout +15 confirmed [{direction}]: {base_bo_desc}")
+    details["base_bo_pts"] = round(base_bo_pts, 1)
+
     # ── Candlestick (7 pts tiered)
     candle_pts, candle_name = score_candlestick(ohlcv_15m, direction)
     details["candle_pts"] = round(candle_pts, 1)
@@ -2096,7 +2229,7 @@ def compute_score(
     details["confluence_count"] = confluence_count
 
     total = (htf_pts + ltf_pts + vol_pts + rvol_pts + oi_pts + retest_pts
-             + fib_pts + structure_pts + candle_pts + fund_pts + rsi_pts)
+             + fib_pts + structure_pts + base_bo_pts + candle_pts + fund_pts + rsi_pts)
     total = max(0.0, min(100.0, total))
 
     details["price"] = round(price_now, 8)
@@ -2728,6 +2861,26 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
                 f"Reasons: {', '.join(details.get('entry_reasons', [])) or 'N/A'}\n"
                 f"Claude: _{rationale}_"
             )
+
+        # ── FIX 3: Strict entry candle gate — fetch fresh 15m candles at execution time
+        try:
+            exec_ohlcv = exchange.fetch_ohlcv(symbol, "15m", limit=5)
+        except Exception as _e:
+            log.warning(f"Strict candle fetch failed for {symbol}: {_e} — trade skipped")
+            continue
+
+        strict_ok, strict_fail = _check_entry_candle_strict(exec_ohlcv, direction)
+        if not strict_ok:
+            log.info(
+                f"Strict entry candle FAILED [{symbol} {direction}]: "
+                f"{strict_fail} — trade skipped"
+            )
+            send_telegram(
+                f"⚠️ *Entry Candle Rejected*\n"
+                f"`{symbol}` [{direction}] score `{final_score}/100`\n"
+                f"Reason: _{strict_fail}_"
+            )
+            continue
 
         if direction == "LONG":
             if open_long(exchange, symbol, price, details, rationale, final_score, session):
