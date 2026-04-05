@@ -1169,11 +1169,13 @@ def score_htf_trend(ohlcv_by_tf: dict, direction: str) -> tuple[float, bool]:
 
 def score_ltf_alignment(ohlcv_by_tf: dict, direction: str) -> tuple[float, int, bool]:
     """
-    4H = +7 | 1H = +7 | 15m = +6 if EMA7 aligned with direction.
-    Hard block if < 2 timeframes aligned.
-    Returns (points, aligned_count, blocked).
+    Trend alignment check across 4 timeframes.
+    1D = filter only (0 pts — points already in HTF score).
+    4H = +7 | 1H = +7 | 15m = +6 if EMA7 > EMA25 aligned with direction.
+    Trend confirmed (not blocked) when >= 3 of 4 TFs align.
+    Returns (points, aligned_count, trend_confirmed).
     """
-    tf_weights = {"4h": 7.0, "1h": 7.0, "15m": 6.0}
+    tf_weights = {"1d": 0.0, "4h": 7.0, "1h": 7.0, "15m": 6.0}
     points        = 0.0
     aligned_count = 0
 
@@ -1183,7 +1185,7 @@ def score_ltf_alignment(ohlcv_by_tf: dict, direction: str) -> tuple[float, int, 
             points += pts
             aligned_count += 1
 
-    return points, aligned_count, aligned_count < 3
+    return points, aligned_count, aligned_count >= 3
 
 # ─────────────────────────────────────────────
 #  SCORING: VOLUME & OI — ~20 pts
@@ -1972,10 +1974,10 @@ def compute_score(
     details["oi_pts"]    = round(oi_pts, 1)
     details["rvol_ratio"] = rvol_ratio
 
-    # ── Block 1: Zero/Low Volume — RVOL <= 0.3 means no market participation
-    if rvol_ratio <= 0.3:
+    # ── Block 1: Zero/Low Volume — RVOL < 0.8 means no market participation
+    if rvol_ratio < 0.8:
         details["blocks"].append(f"Zero Volume Block (RVOL={rvol_ratio:.2f})")
-        log.debug(f"Zero Volume Block [{direction}]: RVOL={rvol_ratio:.3f} <= 0.3")
+        log.debug(f"Zero Volume Block [{direction}]: RVOL={rvol_ratio:.3f} < 0.8")
         return 0.0, details, True
 
     # ── Retest Detection (15%+ move check — block or bonus)
@@ -2032,13 +2034,10 @@ def compute_score(
             details["blocks"].append("1D_strongly_opposing")
             return 0.0, details, True
 
-    # ── LTF Alignment (4H, 1H, 15m)
-    ltf_pts, ltf_aligned, ltf_blocked = score_ltf_alignment(ohlcv_by_tf, direction)
+    # ── LTF Alignment (1D filter + 4H + 1H + 15m — 3 of 4 required)
+    ltf_pts, ltf_aligned, trend_confirmed = score_ltf_alignment(ohlcv_by_tf, direction)
     details["ltf_pts"]     = round(ltf_pts, 1)
     details["ltf_aligned"] = ltf_aligned
-    if ltf_blocked:
-        details["blocks"].append("LTF Weak Alignment")
-        return 0.0, details, True
 
     # ── Market Structure Bonus (+5 pts when HH+HL or LH+LL confirmed)
     struct_pts, struct_aligned = score_market_structure_bonus(ohlcv_15m, direction)
@@ -2059,6 +2058,39 @@ def compute_score(
     details["rsi_pts"] = round(rsi_pts, 1)
     if rsi_blocked:
         details["blocks"].append(f"RSI_extreme_{rsi_val:.1f}")
+        return 0.0, details, True
+
+    # ── 4-Confirmation Gate — require minimum 3 of 4:
+    #   TREND     : 3+ of (1D, 4H, 1H, 15m) EMA aligned with direction
+    #   VOLUME    : RVOL >= 1.0 (active participation — not just > 0.8 pass-through)
+    #   STRUCTURE : at least one pattern fired (retest / phase2 / bounce / market structure)
+    #   MOMENTUM  : RSI in healthy zone (not penalised)
+    vol_confirmed      = rvol_ratio >= 1.0
+    struct_confirmed   = (retest_pts > 0 or phase2_pts > 0 or bounce_pts > 0 or struct_pts > 0)
+    momentum_confirmed = rsi_pts >= 0
+
+    conf_map = {
+        "Trend":     trend_confirmed,
+        "Volume":    vol_confirmed,
+        "Structure": struct_confirmed,
+        "Momentum":  momentum_confirmed,
+    }
+    confirmed_count = sum(conf_map.values())
+    confirmed_names = [k for k, v in conf_map.items() if v]
+    missing_names   = [k for k, v in conf_map.items() if not v]
+    details["confirmations"]  = confirmed_count
+    details["conf_confirmed"] = ", ".join(confirmed_names)
+
+    log.debug(
+        f"4-Conf [{direction}] {confirmed_count}/4 — "
+        f"trend={trend_confirmed}({ltf_aligned}/4) vol={vol_confirmed}({rvol_ratio:.2f}) "
+        f"struct={struct_confirmed} momentum={momentum_confirmed}"
+    )
+
+    if confirmed_count < 3:
+        details["blocks"].append(
+            f"Only {confirmed_count}/4 Confirmations — missing: {', '.join(missing_names)}"
+        )
         return 0.0, details, True
 
     total = (htf_pts + ltf_pts + vol_total + struct_pts + retest_pts + fund_pts + rsi_pts
@@ -2101,7 +2133,8 @@ Review this signal for {symbol} on Binance Futures — {direction}.
 
 Score breakdown:
   HTF Trend (1W+1D)     : {details.get('htf_pts', 0)} / 25
-  LTF Align ({details.get('ltf_aligned', 0)}/3 TF)      : {details.get('ltf_pts', 0)} / 20
+  Trend Align ({details.get('ltf_aligned', 0)}/4 TF)    : {details.get('ltf_pts', 0)} / 20
+  Confirmations         : {details.get('conf_confirmed', '—')} ({details.get('confirmations', 0)}/4)
   Volume                : {details.get('vol_pts', 0)} / 15
   RVOL                  : {details.get('rvol_pts', 0)} / 10
   Open Interest (basic) : {details.get('oi_pts', 0)} / 10
@@ -2200,7 +2233,8 @@ def _build_trade_alert(
         f"─────────────────────\n"
         f"*Score Breakdown ({final_score}/100)*\n"
         f"HTF Trend   : `{details.get('htf_pts', 0)}` / 25\n"
-        f"LTF Align   : `{details.get('ltf_pts', 0)}` / 20  ({details.get('ltf_aligned', 0)}/3 TF)\n"
+        f"Trend Align : `{details.get('ltf_pts', 0)}` / 20  ({details.get('ltf_aligned', 0)}/4 TF)\n"
+        f"Confirmed   : `{details.get('conf_confirmed', '—')}` ({details.get('confirmations', 0)}/4)\n"
         f"Volume      : `{details.get('vol_pts', 0)}` + RVOL `{details.get('rvol_pts', 0)}`\n"
         f"OI (basic)  : `{details.get('oi_pts', 0)}` / 10\n"
         f"Mkt Struct  : `{details.get('struct_pts', 0)}` / 5\n"
