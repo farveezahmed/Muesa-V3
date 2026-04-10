@@ -428,21 +428,21 @@ def dashboard() -> str:
     signals   = _db_fetch(
         "SELECT cs.*, s.timestamp AS ts FROM coin_scores cs "
         "LEFT JOIN scans s ON cs.scan_id=s.scan_id "
-        "WHERE cs.blocked=0 AND cs.final_score IS NOT NULL "
+        "WHERE cs.blocked=0 AND cs.final_score IS NOT NULL AND cs.direction='LONG' "
         "ORDER BY cs.id DESC LIMIT 30"
     )
-    trades    = _db_fetch("SELECT * FROM trades ORDER BY trade_id DESC LIMIT 20")
+    trades    = _db_fetch("SELECT * FROM trades WHERE direction='LONG' ORDER BY trade_id DESC LIMIT 20")
     blocked   = _db_fetch(
         "SELECT cs.*, s.timestamp AS ts FROM coin_scores cs "
         "LEFT JOIN scans s ON cs.scan_id=s.scan_id "
-        "WHERE cs.blocked=1 AND cs.block_reason NOT IN ('signal_exclusion','open_position','sl_cooldown') "
+        "WHERE cs.blocked=1 AND cs.direction='LONG' AND cs.block_reason NOT IN ('signal_exclusion','open_position','sl_cooldown') "
         "ORDER BY cs.id DESC LIMIT 50"
     )
     weekly    = (_db_fetch("SELECT * FROM weekly_stats ORDER BY id DESC LIMIT 1") or [{}])[0]
     watchlist = db_get_watchlist_status()
     top_coins = _db_fetch(
         "SELECT symbol, COUNT(*) AS cnt FROM coin_scores "
-        "WHERE blocked=0 AND final_score IS NOT NULL "
+        "WHERE blocked=0 AND final_score IS NOT NULL AND direction='LONG' "
         "GROUP BY symbol ORDER BY cnt DESC LIMIT 10"
     )
     today_utc   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
