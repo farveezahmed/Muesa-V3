@@ -45,8 +45,7 @@ MARGIN_MODE          = "ISOLATED"
 SL_PCT               = 0.03
 TP1_PCT              = 0.06
 TP2_PCT              = 0.10
-SCORE_CLAUDE_CALL    = 65
-SCORE_TRADE_EXEC     = 75
+MIN_CONDITIONS       = 3            # minimum confirmed conditions required to call Claude
 SL_COOLDOWN_HOURS    = 24
 BTC_CRASH_1H_PCT     = 0.05          # 5% BTC 1H drop → market crash block (all trades)
 COIN_MOVE_4H_PCT     = 0.15          # 15% coin move in last 4H candle → skip
@@ -2052,223 +2051,241 @@ def score_oi_analysis(
 
 
 # ─────────────────────────────────────────────
-#  UNIFIED SCORER
+#  LONG-ONLY CONDITION CHECKER (replaces scoring system)
 # ─────────────────────────────────────────────
 
-def compute_score(
+def compute_long_signal(
     exchange: ccxt.binanceusdm,
     symbol: str,
     vol_24h: float,
     ohlcv_by_tf: dict[str, list],
-    direction: str,
-) -> tuple[float, dict, bool]:
+) -> tuple[bool, list, dict]:
     """
-    100-pt scoring framework:
-      HTF Trend        : 20 pts  (1W=10, 1D=10)
-      LTF Alignment    : 15 pts  (4H=5, 1H=5, 15m=5 — ALL 3 required)
-      RVOL             : 12 pts  (>2.0=12, 1.5=9, 1.0=6, 0.5=3, <0.5=block)
-      OI               : 8 pts   (rising+direction=8, flat=3, against=0)
-      Retest           : 12 pts  (staged — only when 4H move >=15%)
-      Fibonacci        : 10 pts  (0.618/0.5+rvol+bounce=10, 0.382/0.786=8, touch=4)
-      Chart Patterns   : 8 pts   (Very Strong=8, Strong=6, Moderate=4)
-      Candlestick      : 7 pts   (Very Strong=7, Strong=5, Moderate=3)
-      RSI              : 4 pts   (divergence=4, cross50=3, trending=2; >80/<20=block)
-      Funding          : 4 pts   (extreme=4, favorable=2, neutral=1; extreme against=block)
-    Total max: 100 pts — capped.
+    LONG-only condition checker — no point scoring.
 
-    6-Layer Confluence Counter (position sizing):
-      Layer 1: RVOL >= 1.2
-      Layer 2: OI confirmed (oi_pts >= 8)
-      Layer 3: All 3 LTF aligned
-      Layer 4: Structure confirmed (retest or chart pattern)
-      Layer 5: Fibonacci confirmed (fib_pts > 0)
-      Layer 6: RSI signal (rsi_pts >= 3)
-    Minimum 3/6 to trade | 3=50% size | 4=75% | 5-6=100%
+    Hard Blocks (any one fails → rejected immediately):
+      • RVOL < 0.5 (dead volume)
+      • LTF < 3/3 aligned (4H, 1H, 15m EMA7 > EMA25)
+      • Funding rate extreme against LONG (rate > 0.1%)
+      • RSI extreme (> 80 or < 20)
+      • Entry candle quality fails
 
-    Returns (score, details, blocked).
+    Conditions collected (all passing checks):
+      • HTF Trend (1W / 1D aligned)
+      • Volume tier ($50M / $150M / $300M+)
+      • RVOL strength (1.0x / 1.5x / 2.0x+)
+      • OI Bullish Confirmation or Neutral
+      • RSI signal (divergence / cross50 / trending)
+      • Retest pattern
+      • Fibonacci level touch/bounce
+      • Structure / Base Breakout
+      • Candlestick pattern
+      • Market Structure HH+HL
+      • OI Analysis (squeeze / liquidation / spike)
+
+    Minimum MIN_CONDITIONS must be met → send to Claude.
+    Position size: <5 conditions=50% | 5-7=75% | 8+=100%.
+    Returns (passed, conditions_list, details).
     """
-    details: dict = {"direction": direction, "blocks": []}
+    direction = "LONG"
+    details: dict = {"direction": direction, "blocks": [], "entry_reasons": []}
+
     ohlcv_15m  = ohlcv_by_tf.get("15m", [])
     ohlcv_4h   = ohlcv_by_tf.get("4h",  [])
     closes_15m = [float(c[4]) for c in ohlcv_15m] if ohlcv_15m else []
     price_now  = closes_15m[-1] if closes_15m else 0.0
     price_prev = closes_15m[-2] if len(closes_15m) >= 2 else price_now
 
-    # ── Volume & OI (24h vol=8 pts, RVOL=12 pts, OI=8 pts; RVOL<0.5 = hard block)
+    details["price"]   = round(price_now, 8)
+    details["vol_24h"] = vol_24h
+
+    # ── Hard Block 1: RVOL < 0.5
     vol_pts, rvol_pts, oi_pts, vol_total, vol_blocked, rvol_ratio = score_volume_oi(
         ohlcv_15m, exchange, symbol, direction, price_now, price_prev, vol_24h
     )
-    details["vol_24h"]   = vol_24h
-    details["vol_pts"]   = round(vol_pts, 1)
-    details["rvol_pts"]  = round(rvol_pts, 1)
-    details["oi_pts"]    = round(oi_pts, 1)
     details["rvol_ratio"] = rvol_ratio
-
+    details["vol_pts"]    = round(vol_pts, 1)
+    details["rvol_pts"]   = round(rvol_pts, 1)
+    details["oi_pts"]     = round(oi_pts, 1)
     if vol_blocked:
-        details["blocks"].append(f"Zero Volume Block (RVOL={rvol_ratio:.2f} < 0.5)")
-        log.debug(f"Zero Volume Block [{direction}]: RVOL={rvol_ratio:.3f}")
-        return 0.0, details, True
+        details["blocks"].append(f"Low RVOL ({rvol_ratio:.2f} < 0.5)")
+        log.debug(f"LONG blocked — Low RVOL: {rvol_ratio:.3f}")
+        return False, [], details
 
-    # ── HTF Trend (1W=10, 1D=10 — no hard block)
-    htf_pts, _ = score_htf_trend(ohlcv_by_tf, direction)
-    details["htf_pts"] = round(htf_pts, 1)
-
-    # ── LTF Alignment (4H+1H+15m — ALL 3 required, hard block if <3)
+    # ── Hard Block 2: LTF Alignment < 3/3
     ltf_pts, ltf_aligned, trend_confirmed = score_ltf_alignment(ohlcv_by_tf, direction)
     details["ltf_pts"]     = round(ltf_pts, 1)
     details["ltf_aligned"] = ltf_aligned
     if not trend_confirmed:
-        details["blocks"].append(f"LTF Trend Block ({ltf_aligned}/3 aligned)")
-        return 0.0, details, True
+        details["blocks"].append(f"LTF Not Aligned ({ltf_aligned}/3 timeframes)")
+        return False, [], details
 
-    # ── Retest Detection (staged 12 pts — never blocks)
-    retest_pts, _ = score_retest_detection(ohlcv_4h, ohlcv_15m, direction)
-    details["retest_pts"] = round(retest_pts, 1)
-    if retest_pts > 0:
-        details.setdefault("entry_reasons", []).append(f"Retest +{retest_pts:.0f}")
-
-    # ── Fibonacci (tiered 10/8/4 pts — RVOL>=1.2 gate inside)
-    fib_pts, fib_label = score_fibonacci_retracement(ohlcv_4h, ohlcv_15m, price_now, direction)
-    details["fib_pts"] = round(fib_pts, 1)
-    if fib_label:
-        details.setdefault("entry_reasons", []).append(fib_label)
-
-    # ── Structure: Breakout Setup (0–20 pts; < 15 = 0, >= 15 = strong)
-    structure_pts, structure_desc = score_structure_breakout(ohlcv_15m, direction)
-    details["structure_pts"] = round(structure_pts, 1)
-    if structure_desc:
-        details.setdefault("entry_reasons", []).append(f"Structure: {structure_desc}")
-
-    # ── FIX 2: Base Breakout flat +15 bonus (uses _detect_base_breakout helper)
-    base_bo_pts = 0.0
-    base_bo_ok, base_bo_desc = _detect_base_breakout(ohlcv_15m, direction)
-    if base_bo_ok:
-        base_bo_pts = 15.0
-        details.setdefault("entry_reasons", []).append(f"BaseBO: {base_bo_desc}")
-        log.info(f"Base Breakout +15 confirmed [{direction}]: {base_bo_desc}")
-    details["base_bo_pts"]   = round(base_bo_pts, 1)
-    details["structure_pts"] = round(base_bo_pts, 1)   # structure slot = base breakout bonus
-
-    # ── Candlestick (7 pts tiered)
-    candle_pts, candle_name = score_candlestick(ohlcv_15m, direction)
-    details["candle_pts"] = round(candle_pts, 1)
-    if candle_name:
-        details.setdefault("entry_reasons", []).append(f"Candle: {candle_name}")
-
-    # ── Funding Rate (4 pts tiered — extreme against = hard block)
+    # ── Hard Block 3: Funding Rate extreme against LONG
     fund_pts, fund_blocked = score_funding(exchange, symbol, direction)
     details["fund_pts"] = round(fund_pts, 1)
     if fund_blocked:
-        details["blocks"].append("funding_extreme_against")
-        return 0.0, details, True
+        details["blocks"].append("Funding Rate Extreme Against LONG")
+        return False, [], details
 
-    # ── RSI (4 pts tiered — >80/<20 = hard block)
+    # ── Hard Block 4: RSI Extreme (> 80 or < 20)
     rsi_pts, rsi_val, rsi_blocked = score_rsi_confirming(closes_15m, direction)
     details["rsi"]     = round(rsi_val, 2)
     details["rsi_pts"] = round(rsi_pts, 1)
     if rsi_blocked:
-        details["blocks"].append(f"RSI_extreme_{rsi_val:.1f}")
-        return 0.0, details, True
+        details["blocks"].append(f"RSI Extreme ({rsi_val:.1f})")
+        return False, [], details
 
-    # ── 6-Layer Confluence Counter
-    layer1_vol     = rvol_ratio >= 1.2
-    layer2_oi      = oi_pts >= 8.0
-    layer3_trend   = trend_confirmed                         # all 3 LTF (already gated above)
-    layer4_struct  = (retest_pts > 0 or structure_pts > 0)
-    layer5_fib     = fib_pts > 0
-    layer6_rsi     = rsi_pts >= 3
+    # ── Hard Block 5: Entry Candle Quality
+    candle_ok, candle_fail = check_entry_candle_quality(ohlcv_15m, direction)
+    if not candle_ok:
+        details["blocks"].append(f"Weak Entry Candle: {candle_fail}")
+        log.debug(f"LONG blocked — Weak Entry Candle: {candle_fail}")
+        return False, [], details
 
-    conf_map = {
-        "Volume":    layer1_vol,
-        "OI":        layer2_oi,
-        "Trend":     layer3_trend,
-        "Structure": layer4_struct,
-        "Fibonacci": layer5_fib,
-        "RSI":       layer6_rsi,
-    }
-    confluence_count  = sum(conf_map.values())
-    confluence_names  = [k for k, v in conf_map.items() if v]
-    missing_names     = [k for k, v in conf_map.items() if not v]
-    details["confluence"]       = confluence_count
-    details["conf_confirmed"]   = ", ".join(confluence_names)
-    details["ltf_aligned"]      = ltf_aligned
+    # ── Collect confirmed conditions
+    conditions: list[str] = []
 
-    log.debug(
-        f"Confluence [{direction}] {confluence_count}/6 — "
-        f"{', '.join(confluence_names)} | missing: {', '.join(missing_names)}"
+    # LTF Alignment (already confirmed — always add)
+    conditions.append(f"LTF Aligned ({ltf_aligned}/3 TF)")
+
+    # HTF Trend
+    htf_pts, _ = score_htf_trend(ohlcv_by_tf, direction)
+    details["htf_pts"] = round(htf_pts, 1)
+    if htf_pts >= 10:
+        conditions.append(f"HTF Trend ({htf_pts:.0f}/20 pts)")
+
+    # Volume tier
+    if vol_24h >= VOLUME_HIGH_USDT:
+        conditions.append(f"High Volume (${vol_24h/1e6:.0f}M)")
+    elif vol_24h >= VOLUME_MID_USDT:
+        conditions.append(f"Mid Volume (${vol_24h/1e6:.0f}M)")
+    else:
+        conditions.append(f"Min Volume (${vol_24h/1e6:.0f}M)")
+
+    # RVOL strength
+    if rvol_ratio >= 2.0:
+        conditions.append(f"Very High RVOL ({rvol_ratio:.1f}x)")
+    elif rvol_ratio >= 1.5:
+        conditions.append(f"High RVOL ({rvol_ratio:.1f}x)")
+    elif rvol_ratio >= 1.0:
+        conditions.append(f"RVOL OK ({rvol_ratio:.1f}x)")
+
+    # OI direction
+    if oi_pts >= 8.0:
+        conditions.append("OI Bullish Confirmation")
+    elif oi_pts >= 3.0:
+        conditions.append("OI Neutral")
+
+    # RSI signal
+    if rsi_pts >= 4:
+        conditions.append(f"RSI Divergence (RSI={rsi_val:.0f})")
+    elif rsi_pts >= 3:
+        conditions.append(f"RSI Cross 50 (RSI={rsi_val:.0f})")
+    elif rsi_pts >= 2:
+        conditions.append(f"RSI Trending Up (RSI={rsi_val:.0f})")
+
+    # Funding favorable
+    if fund_pts >= 2:
+        conditions.append("Funding Favorable for LONG")
+
+    # Retest pattern
+    retest_pts, _ = score_retest_detection(ohlcv_4h, ohlcv_15m, direction)
+    details["retest_pts"] = round(retest_pts, 1)
+    if retest_pts > 0:
+        conditions.append("Retest Pattern Confirmed")
+
+    # Fibonacci level
+    fib_pts, fib_label = score_fibonacci_retracement(ohlcv_4h, ohlcv_15m, price_now, direction)
+    details["fib_pts"] = round(fib_pts, 1)
+    if fib_label:
+        conditions.append(fib_label)
+
+    # Structure / Base Breakout
+    structure_pts, structure_desc = score_structure_breakout(ohlcv_15m, direction)
+    details["structure_pts"] = round(structure_pts, 1)
+    if structure_desc:
+        conditions.append(f"Structure: {structure_desc}")
+
+    base_bo_ok, base_bo_desc = _detect_base_breakout(ohlcv_15m, direction)
+    details["base_bo_pts"] = 15.0 if base_bo_ok else 0.0
+    if base_bo_ok:
+        conditions.append(f"Base Breakout: {base_bo_desc}")
+        log.info(f"Base Breakout confirmed [LONG]: {base_bo_desc}")
+
+    # Candlestick pattern
+    candle_pts, candle_name = score_candlestick(ohlcv_15m, direction)
+    details["candle_pts"] = round(candle_pts, 1)
+    if candle_name:
+        conditions.append(f"Candle: {candle_name}")
+
+    # Market Structure HH+HL
+    ms_pts, ms_ok = score_market_structure_bonus(ohlcv_15m, direction)
+    if ms_ok:
+        conditions.append("Market Structure: HH+HL")
+
+    # OI Analysis (short squeeze / liquidation / spike)
+    oi_analysis_pts, oi_reasons = score_oi_analysis(
+        exchange, symbol, direction, price_now, price_prev
     )
+    details["oi_analysis_pts"] = round(oi_analysis_pts, 1)
+    for r in oi_reasons:
+        conditions.append(r)
 
-    if confluence_count < 3:
+    # ── Minimum conditions gate
+    if len(conditions) < MIN_CONDITIONS:
         details["blocks"].append(
-            f"Confluence {confluence_count}/6 — need 3 min | missing: {', '.join(missing_names)}"
+            f"Insufficient conditions ({len(conditions)}/{MIN_CONDITIONS} required)"
         )
-        return 0.0, details, True
+        return False, conditions, details
 
-    # ── Position size multiplier based on confluence
-    if confluence_count >= 5:
+    # ── Position size based on condition count
+    n = len(conditions)
+    if n >= 8:
         size_mult = 1.00
-    elif confluence_count == 4:
+    elif n >= 5:
         size_mult = 0.75
     else:
         size_mult = 0.50
-    details["size_mult"]       = size_mult
-    details["confluence_count"] = confluence_count
+    details["size_mult"]    = size_mult
+    details["entry_reasons"] = conditions
 
-    total = (htf_pts + ltf_pts + vol_total + retest_pts
-             + fib_pts + base_bo_pts + candle_pts + fund_pts + rsi_pts)
-    total = min(100.0, total)
-
-    details["price"] = round(price_now, 8)
-    details["total"] = round(total, 1)
-
-    # ── Entry Candle Quality (final gate)
-    candle_ok, candle_fail_reason = check_entry_candle_quality(ohlcv_15m, direction)
-    if not candle_ok:
-        details["blocks"].append(f"Weak Entry Candle: {candle_fail_reason}")
-        log.debug(f"Entry candle quality FAILED [{direction}]: {candle_fail_reason}")
-        return 0.0, details, True
-
-    return round(total, 1), details, False
+    return True, conditions, details
 
 # ─────────────────────────────────────────────
 #  CLAUDE ANALYSIS
 # ─────────────────────────────────────────────
 
-def call_claude(symbol: str, details: dict, direction: str) -> tuple[float, str]:
-    """Returns (adjusted_score 0-100, rationale string)."""
+def call_claude(symbol: str, conditions: list, details: dict) -> tuple[bool, str]:
+    """Returns (approved: bool, rationale: str). LONG only."""
     api_key = os.getenv("ANTHROPIC_API_KEY") or CLAUDE_API_KEY
-    client = anthropic.Anthropic(api_key=api_key)
+    client  = anthropic.Anthropic(api_key=api_key)
 
-    fib_label    = next((r for r in details.get("entry_reasons", []) if r.startswith("Fibonacci")), "n/a")
-    struct_label2 = next((r for r in details.get("entry_reasons", []) if r.startswith("Structure")), "n/a")
-    candle_label = next((r for r in details.get("entry_reasons", []) if r.startswith("Candle")), "n/a")
-    retest_label = next((r for r in details.get("entry_reasons", []) if r.startswith("Retest")), "n/a")
-    size_pct     = int(details.get("size_mult", 1.0) * 100)
-    prompt = f"""You are MUESA, a professional crypto futures trading AI.
+    conditions_text = "\n".join(f"  ✓ {c}" for c in conditions)
+    size_pct        = int(details.get("size_mult", 1.0) * 100)
 
-Review this signal for {symbol} on Binance Futures — {direction}.
+    prompt = f"""You are MUESA, a professional crypto futures trading AI. LONG trades only.
 
-Score breakdown (100 pts system):
-  HTF Trend (1W+1D)    : {details.get('htf_pts', 0)} / 20
-  LTF Align ({details.get('ltf_aligned', 0)}/3 TF)    : {details.get('ltf_pts', 0)} / 15
-  Confluence           : {details.get('conf_confirmed', '—')} ({details.get('confluence', 0)}/6)
-  24h Volume           : {details.get('vol_pts', 0)} / 8   (${details.get('vol_24h', 0)/1e6:.0f}M)
-  RVOL                 : {details.get('rvol_pts', 0)} / 12
-  Open Interest        : {details.get('oi_pts', 0)} / 8
-  Retest (staged)      : {retest_label} / 12
-  Fibonacci            : {fib_label} / 10
-  Structure (Breakout) : {struct_label2} / 20  (min 15 to count)
-  Candlestick          : {candle_label} / 7
-  Funding Rate         : {details.get('fund_pts', 0)} / 4
-  RSI ({details.get('rsi', 'N/A')})             : {details.get('rsi_pts', 0)} / 4
-  Base total           : {details.get('total', 0)} / 100
-  Position size        : {size_pct}% of allocation
-  Price                : {details.get('price', 'N/A')}
-  Direction            : {direction}
+Review this LONG signal for {symbol} on Binance Futures.
 
-Be conservative. Penalise weak HTF trend, poor LTF alignment, or low confluence.
+Confirmed conditions ({len(conditions)} total):
+{conditions_text}
+
+Key details:
+  Price      : {details.get('price', 'N/A')}
+  RVOL       : {details.get('rvol_ratio', 0):.2f}x average volume
+  RSI        : {details.get('rsi', 'N/A')}
+  HTF Trend  : {details.get('htf_pts', 0)}/20
+  LTF Aligned: {details.get('ltf_aligned', 0)}/3 timeframes
+  Volume     : ${details.get('vol_24h', 0)/1e6:.0f}M 24h
+  Size       : {size_pct}% of allocation
+
+Should this LONG trade be executed?
+Be conservative. Reject weak setups, low confluence, or insufficient conviction.
+
 Return ONLY this JSON (no markdown):
-{{"score": <integer 0-100>, "rationale": "<max 20 words>"}}"""
+{{"approved": true, "rationale": "<max 20 words>"}}
+or
+{{"approved": false, "rationale": "<max 20 words>"}}"""
 
     try:
         message = client.messages.create(
@@ -2277,19 +2294,18 @@ Return ONLY this JSON (no markdown):
             messages=[{"role": "user", "content": prompt}],
         )
         raw = message.content[0].text.strip()
-        # Claude sometimes wraps response in markdown fences — extract the JSON object
         import re as _re
         match = _re.search(r'\{[^{}]+\}', raw, _re.DOTALL)
         if not match:
             log.error(f"Claude returned no JSON for {symbol}. Raw: {repr(raw[:120])}")
-            return 0.0, "Claude analysis failed."
+            return False, "Claude analysis failed."
         data      = json.loads(match.group())
-        score     = max(0, min(100, int(data.get("score", 0))))
+        approved  = bool(data.get("approved", False))
         rationale = str(data.get("rationale", ""))
-        return float(score), rationale
+        return approved, rationale
     except Exception as e:
         log.error(f"Claude API error for {symbol}: {e}")
-        return 0.0, "Claude analysis failed."
+        return False, "Claude analysis failed."
 
 # ─────────────────────────────────────────────
 #  POSITION SIZING
@@ -2326,48 +2342,36 @@ def set_leverage_and_margin(exchange: ccxt.binanceusdm, symbol: str) -> None:
         log.warning(f"Leverage/margin setup for {symbol}: {e}")
 
 def _build_trade_alert(
-    direction: str,
     symbol: str,
     entry: float,
     qty: float,
     sl: float,
     tp1: float,
     tp2: float,
+    conditions: list,
     details: dict,
     rationale: str,
-    final_score: float,
     session: str,
 ) -> str:
-    sl_side  = "-3%" if direction == "LONG" else "+3%"
-    tp1_side = "+6%" if direction == "LONG" else "-6%"
-    tp2_side = "+10%" if direction == "LONG" else "-10%"
+    conditions_text = "\n".join(f"  ✓ {c}" for c in conditions)
     return (
-        f"*MUESA v3.0 — {direction} OPENED*\n"
+        f"*MUESA v3.0 — LONG OPENED* 🟢\n"
         f"─────────────────────\n"
         f"Symbol  : `{symbol}`\n"
         f"Session : `{session}`\n"
         f"Entry   : `{entry}`\n"
         f"Qty     : `{qty}`\n"
-        f"SL      : `{sl}` ({sl_side})\n"
-        f"TP1     : `{tp1}` ({tp1_side})\n"
-        f"TP2     : `{tp2}` ({tp2_side})\n"
+        f"SL      : `{sl}` (-3%)\n"
+        f"TP1     : `{tp1}` (+6%)\n"
+        f"TP2     : `{tp2}` (+10%)\n"
+        f"Size    : `{int(details.get('size_mult', 1.0) * 100)}%` of allocation\n"
         f"─────────────────────\n"
-        f"*Score Breakdown ({final_score}/100)*\n"
-        f"HTF Trend    : `{details.get('htf_pts', 0)}` / 20\n"
-        f"LTF Align    : `{details.get('ltf_pts', 0)}` / 15  ({details.get('ltf_aligned', 0)}/3 TF)\n"
-        f"Confluence   : `{details.get('conf_confirmed', '—')}` ({details.get('confluence', 0)}/6)\n"
-        f"24h Volume   : `{details.get('vol_pts', 0)}` / 8  (${details.get('vol_24h', 0)/1e6:.0f}M)\n"
-        f"RVOL         : `{details.get('rvol_pts', 0)}` / 12  (x{details.get('rvol_ratio', 0):.2f})\n"
-        f"OI           : `{details.get('oi_pts', 0)}` / 8\n"
-        f"Retest       : `{details.get('retest_pts', 0)}` / 12\n"
-        f"Fibonacci    : `{details.get('fib_pts', 0)}` / 10\n"
-        f"Structure    : `{details.get('structure_pts', 0)}` / 20  (15+ = strong)\n"
-        f"Candlestick  : `{details.get('candle_pts', 0)}` / 7\n"
-        f"Funding      : `{details.get('fund_pts', 0)}` / 4\n"
-        f"RSI ({details.get('rsi','?')})    : `{details.get('rsi_pts', 0)}` / 4\n"
-        f"Size         : `{int(details.get('size_mult', 1.0) * 100)}%` of allocation\n"
+        f"*Confirmed Conditions ({len(conditions)})*\n"
+        f"{conditions_text}\n"
         f"─────────────────────\n"
-        f"Patterns    : _{', '.join(details.get('entry_reasons', [])) or 'None'}_\n"
+        f"RVOL    : `{details.get('rvol_ratio', 0):.2f}x`\n"
+        f"RSI     : `{details.get('rsi', 'N/A')}`\n"
+        f"Volume  : `${details.get('vol_24h', 0)/1e6:.0f}M`\n"
         f"─────────────────────\n"
         f"AI Note : _{rationale}_"
     )
@@ -2378,10 +2382,10 @@ def open_long(
     price: float,
     details: dict,
     rationale: str,
-    final_score: float,
+    cond_count: float,
     session: str,
 ) -> bool:
-    """Returns True if trade was successfully opened."""
+    """Returns True if trade was successfully opened. LONG only."""
     size_mult = details.get("size_mult", 1.0)
     qty = get_position_size(exchange, symbol, price, size_mult)
     if qty <= 0:
@@ -2430,88 +2434,18 @@ def open_long(
             "order_id": order_id, "opened_at": datetime.now(timezone.utc).isoformat(),
         }
         entry_reasons = ", ".join(details.get("entry_reasons", []))
+        cond_count    = len(details.get("entry_reasons", []))
         db_log_trade(_current_scan_id, symbol, "LONG", entry_price,
-                     sl_price, tp1_price, tp2_price, qty, final_score, entry_reasons)
-        log.info(f"LONG opened: {symbol} @ {entry_price}  score={final_score}")
+                     sl_price, tp1_price, tp2_price, qty, float(cond_count), entry_reasons)
+        log.info(f"LONG opened: {symbol} @ {entry_price}  conditions={cond_count}")
         send_telegram(_build_trade_alert(
-            "LONG", symbol, entry_price, qty, sl_price, tp1_price, tp2_price,
-            details, rationale, final_score, session,
+            symbol, entry_price, qty, sl_price, tp1_price, tp2_price,
+            details.get("entry_reasons", []), details, rationale, session,
         ))
         return True
     except Exception as e:
         log.error(f"LONG order failed for {symbol}: {e}")
         send_telegram(f"*MUESA ERROR* — LONG order failed `{symbol}`:\n`{e}`")
-        return False
-
-def open_short(
-    exchange: ccxt.binanceusdm,
-    symbol: str,
-    price: float,
-    details: dict,
-    rationale: str,
-    final_score: float,
-    session: str,
-) -> bool:
-    """Returns True if trade was successfully opened."""
-    size_mult = details.get("size_mult", 1.0)
-    qty = get_position_size(exchange, symbol, price, size_mult)
-    if qty <= 0:
-        log.warning(f"Invalid qty for {symbol}, skipping.")
-        return False
-
-    sl_price  = round(price * (1 + SL_PCT), 8)
-    tp1_price = round(price * (1 - TP1_PCT), 8)
-    tp2_price = round(price * (1 - TP2_PCT), 8)
-
-    try:
-        set_leverage_and_margin(exchange, symbol)
-        # One-Way Mode — no positionSide in params (account is not Hedge Mode)
-        order = exchange.create_order(
-            symbol=symbol, type="market", side="sell", amount=qty,
-        )
-        entry_price = float(order.get("average") or price)
-        order_id    = order.get("id", "N/A")
-
-        # Recalculate SL/TP from actual fill price
-        sl_price  = round(entry_price * (1 + SL_PCT), 8)
-        tp1_price = round(entry_price * (1 - TP1_PCT), 8)
-        tp2_price = round(entry_price * (1 - TP2_PCT), 8)
-
-        # SL: closePosition closes entire position without specifying amount
-        exchange.create_order(
-            symbol=symbol, type="stop_market", side="buy", amount=qty,
-            params={"stopPrice": sl_price, "closePosition": True},
-        )
-        # TP1: half position — reduceOnly ensures it only reduces, never flips
-        exchange.create_order(
-            symbol=symbol, type="take_profit_market", side="buy",
-            amount=round(qty / 2, 6),
-            params={"stopPrice": tp1_price, "reduceOnly": True},
-        )
-        # TP2: remaining half
-        exchange.create_order(
-            symbol=symbol, type="take_profit_market", side="buy",
-            amount=round(qty / 2, 6),
-            params={"stopPrice": tp2_price, "reduceOnly": True},
-        )
-
-        open_positions[symbol] = {
-            "direction": "SHORT", "entry": entry_price, "qty": qty,
-            "sl": sl_price, "tp1": tp1_price, "tp2": tp2_price,
-            "order_id": order_id, "opened_at": datetime.now(timezone.utc).isoformat(),
-        }
-        entry_reasons = ", ".join(details.get("entry_reasons", []))
-        db_log_trade(_current_scan_id, symbol, "SHORT", entry_price,
-                     sl_price, tp1_price, tp2_price, qty, final_score, entry_reasons)
-        log.info(f"SHORT opened: {symbol} @ {entry_price}  score={final_score}")
-        send_telegram(_build_trade_alert(
-            "SHORT", symbol, entry_price, qty, sl_price, tp1_price, tp2_price,
-            details, rationale, final_score, session,
-        ))
-        return True
-    except Exception as e:
-        log.error(f"SHORT order failed for {symbol}: {e}")
-        send_telegram(f"*MUESA ERROR* — SHORT order failed `{symbol}`:\n`{e}`")
         return False
 
 # ─────────────────────────────────────────────
@@ -2740,7 +2674,7 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
                 log.info(f"[WATCHLIST] {wl_sym} injected into scan (vol={wl_vol:,.0f})")
                 send_telegram(f"👁 *Watchlist Scan* — Monitoring `{wl_sym}` this cycle.")
 
-    candidates: list[tuple[float, str, str, dict, int]] = []  # (score, sym, dir, details, coin_row_id)
+    candidates: list[tuple[int, str, list, dict, int]] = []  # (cond_count, sym, conditions, details, row_id)
     signals_found = 0
 
     for symbol, vol_24h in symbol_vols:
@@ -2748,21 +2682,18 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
         # ── Coins excluded from signal generation — log and skip
         if symbol in SIGNAL_EXCLUDE:
             log.debug(f"{symbol} — skipped (signal exclusion list)")
-            for direction in ("LONG", "SHORT"):
-                db_log_coin(_current_scan_id, symbol, direction, {}, True, "signal_exclusion")
+            db_log_coin(_current_scan_id, symbol, "LONG", {}, True, "signal_exclusion")
             continue
 
         # ── Already in an open position — log and skip
         if symbol in open_positions:
-            for direction in ("LONG", "SHORT"):
-                db_log_coin(_current_scan_id, symbol, direction, {}, True, "open_position")
+            db_log_coin(_current_scan_id, symbol, "LONG", {}, True, "open_position")
             continue
 
         # ── SL cooldown active — log and skip
         if symbol in sl_hit_symbols:
             log.debug(f"{symbol} — skipped (SL cooldown active)")
-            for direction in ("LONG", "SHORT"):
-                db_log_coin(_current_scan_id, symbol, direction, {}, True, "sl_cooldown")
+            db_log_coin(_current_scan_id, symbol, "LONG", {}, True, "sl_cooldown")
             continue
 
         if len(open_positions) >= MAX_OPEN_POSITIONS:
@@ -2770,110 +2701,85 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
 
         ohlcv_by_tf = fetch_multi_tf_ohlcv(exchange, symbol)
 
-        best_score     = 0.0
-        best_direction = None
-        best_details: dict = {}
-        best_row_id: int   = -1
+        # ── LONG-only condition check (no scoring)
+        passed, conditions, details = compute_long_signal(
+            exchange, symbol, vol_24h, ohlcv_by_tf
+        )
+        block_reason = ", ".join(details.get("blocks", [])) if not passed else ""
+        row_id = db_log_coin(_current_scan_id, symbol, "LONG", details, not passed, block_reason)
 
-        for direction in ("LONG", "SHORT"):
-            score, details, blocked = compute_score(
-                exchange, symbol, vol_24h, ohlcv_by_tf, direction
-            )
-            block_reason = ", ".join(details.get("blocks", [])) if blocked else ""
-            # ── Log EVERY coin/direction to DB regardless of score or block status
-            row_id = db_log_coin(_current_scan_id, symbol, direction, details, blocked, block_reason)
-
-            if not blocked and score > best_score:
-                best_score     = score
-                best_direction = direction
-                best_details   = details
-                best_row_id    = row_id
-
-        if best_direction is None or best_score < SCORE_CLAUDE_CALL:
-            log.debug(f"{symbol} — best score {best_score:.1f} < {SCORE_CLAUDE_CALL}")
+        if not passed:
+            log.debug(f"{symbol} — LONG blocked: {block_reason}")
             continue
 
         signals_found += 1
         log.info(
-            f"{symbol} [{best_direction}] score={best_score} >= {SCORE_CLAUDE_CALL} -> calling Claude | "
-            f"htf={best_details.get('htf_pts')} ltf={best_details.get('ltf_pts')} "
-            f"vol={best_details.get('vol_pts')} rvol={best_details.get('rvol_pts')} "
-            f"oi={best_details.get('oi_pts')} struct={best_details.get('struct_pts')} "
-            f"retest={best_details.get('retest_pts')} fund={best_details.get('fund_pts')} "
-            f"rsi={best_details.get('rsi_pts')} phase2={best_details.get('phase2_pts')} "
-            f"fib={best_details.get('fib_pts')} oi_analysis={best_details.get('oi_analysis_pts')} | "
-            f"patterns=[{', '.join(best_details.get('entry_reasons', []))}]"
+            f"{symbol} [LONG] — {len(conditions)} conditions confirmed → calling Claude | "
+            f"RVOL={details.get('rvol_ratio', 0):.2f}x RSI={details.get('rsi', '?')} | "
+            f"Conditions: [{', '.join(conditions)}]"
         )
 
-        claude_score, rationale = call_claude(symbol, best_details, best_direction)
-        final_score = round((best_score + claude_score) / 2, 1)
+        approved, rationale = call_claude(symbol, conditions, details)
 
         log.info(
-            f"{symbol} [{best_direction}] tech={best_score} claude={claude_score} "
-            f"final={final_score} | {rationale}"
+            f"{symbol} [LONG] — Claude: {'✅ APPROVED' if approved else '❌ REJECTED'} | {rationale}"
         )
 
-        # ── Update coin_scores row with Claude result
-        db_update_coin_claude(best_row_id, claude_score, final_score, rationale)
+        # ── Store Claude result in DB (use conditions count as pseudo-score for display)
+        cond_score = float(len(conditions) * 10)
+        db_update_coin_claude(row_id, cond_score if approved else 0.0,
+                              cond_score if approved else 0.0, rationale)
 
-        if final_score >= SCORE_TRADE_EXEC:
-            candidates.append((final_score, symbol, best_direction, best_details, best_row_id))
-            best_details["_rationale"]   = rationale
-            best_details["_final_score"] = final_score
+        if approved:
+            candidates.append((len(conditions), symbol, conditions, details, row_id))
+            details["_rationale"] = rationale
 
         time.sleep(0.3)
 
-    # Execute best candidate only (1 per scan)
+    # Execute best candidate (most conditions confirmed) — 1 per scan
     candidates.sort(key=lambda x: x[0], reverse=True)
     trades_taken = 0
 
     if trading_paused:
         log.info("Trading is PAUSED — skipping trade execution this scan.")
 
-    for final_score, symbol, direction, details, _row_id in candidates[:1]:
+    for cond_count, symbol, conditions, details, _row_id in candidates[:1]:
         if trading_paused:
             break
         if symbol in open_positions:
             continue
 
         price     = details.get("price", 0.0)
-        rationale = details.get("_rationale", f"{direction} score {final_score}/100")
+        rationale = details.get("_rationale", f"LONG — {cond_count} conditions confirmed")
 
         is_watchlist = symbol in watchlist_symbols
         if is_watchlist:
             send_telegram(
                 f"⭐ *Watchlist Trade Triggered!*\n"
-                f"`{symbol}` [{direction}] scored `{final_score}/100`\n"
-                f"Reasons: {', '.join(details.get('entry_reasons', [])) or 'N/A'}\n"
+                f"`{symbol}` [LONG] — {cond_count} conditions confirmed\n"
+                f"Conditions: {', '.join(conditions) or 'N/A'}\n"
                 f"Claude: _{rationale}_"
             )
 
-        # ── FIX 3: Strict entry candle gate — fetch fresh 15m candles at execution time
+        # ── Strict entry candle gate — fetch fresh 15m candles at execution time
         try:
             exec_ohlcv = exchange.fetch_ohlcv(symbol, "15m", limit=5)
         except Exception as _e:
             log.warning(f"Strict candle fetch failed for {symbol}: {_e} — trade skipped")
             continue
 
-        strict_ok, strict_fail = _check_entry_candle_strict(exec_ohlcv, direction)
+        strict_ok, strict_fail = _check_entry_candle_strict(exec_ohlcv, "LONG")
         if not strict_ok:
-            log.info(
-                f"Strict entry candle FAILED [{symbol} {direction}]: "
-                f"{strict_fail} — trade skipped"
-            )
+            log.info(f"Strict entry candle FAILED [{symbol} LONG]: {strict_fail} — trade skipped")
             send_telegram(
                 f"⚠️ *Entry Candle Rejected*\n"
-                f"`{symbol}` [{direction}] score `{final_score}/100`\n"
+                f"`{symbol}` [LONG] — {cond_count} conditions\n"
                 f"Reason: _{strict_fail}_"
             )
             continue
 
-        if direction == "LONG":
-            if open_long(exchange, symbol, price, details, rationale, final_score, session):
-                trades_taken += 1
-        else:
-            if open_short(exchange, symbol, price, details, rationale, final_score, session):
-                trades_taken += 1
+        if open_long(exchange, symbol, price, details, rationale, float(cond_count), session):
+            trades_taken += 1
 
     db_finish_scan(_current_scan_id, len(symbol_vols), signals_found, trades_taken)
 
