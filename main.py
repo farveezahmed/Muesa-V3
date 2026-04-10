@@ -53,14 +53,17 @@ CONSOL_MAX_RANGE_HARD= 0.08     # hard skip if range > 8%
 BREAKOUT_MIN_PCT     = 0.005    # close must be ≥ 0.5% above range high
 BREAKOUT_BODY_MIN    = 0.60     # breakout candle body ≥ 60% of range
 UPPER_WICK_MAX_PCT   = 0.40     # skip if upper wick > 40% of candle range
-VOLUME_SURGE_MIN     = 2.0      # volume ≥ 2x 20-period avg (hard requirement)
+VOLUME_SURGE_MIN     = 2.0      # hard minimum — below this → skip
+VOLUME_SURGE_PREF    = 2.5      # preferred — 2x–2.5x treated as weak signal
+CONSOL_PREF_MIN      = 0.03     # preferred range lower bound (3%)
+CONSOL_PREF_MAX      = 0.05     # preferred range upper bound (5%)
 MAX_ENTRY_DELAY      = 3        # max candles after breakout to still enter
 MOVE_FILTER_1H_PCT   = 0.15     # skip if already moved ≥ 15% in last 1H
 
 # ── Risk / Reward (structure-based SL)
 SL_BUFFER_PCT        = 0.002    # SL placed 0.2% below range low
 TP1_R                = 2.0      # TP1 at 2R → move SL to breakeven
-TP2_R                = 4.0      # TP2 at 4R
+TRAIL_CALLBACK_PCT   = 2.0      # TP2 trailing stop callback % (replaces fixed 4R)
 
 # ── Guards
 SL_COOLDOWN_HOURS    = 24
@@ -554,7 +557,7 @@ def dashboard() -> str:
 <h1>⚡ MUESA v3.0 — Momentum Breakout</h1>
 <p class="sub">LONG Only · No AI · No Scoring · Structure + Volume + Breakout · 15m</p>
 <div class="grid">
-  <div class="card"><div class="label">Strategy</div><div class="value" style="font-size:13px;color:#2ea043">Momentum Breakout</div><div class="sub-val">RVOL≥{VOLUME_SURGE_MIN}x · Range≤{CONSOL_MAX_RANGE:.0%} · TP={TP1_R:.0f}R/{TP2_R:.0f}R</div></div>
+  <div class="card"><div class="label">Strategy</div><div class="value" style="font-size:13px;color:#2ea043">Momentum Breakout</div><div class="sub-val">RVOL≥{VOLUME_SURGE_MIN}x (pref≥{VOLUME_SURGE_PREF}x) · Range 3–5% · TP1={TP1_R:.0f}R+Trail</div></div>
   <div class="card"><div class="label">Open Positions</div><div class="value {'green' if open_positions else ''}">{len(open_positions)}/{MAX_OPEN_POSITIONS}</div><div class="sub-val">{'Active: ' + ', '.join(open_positions.keys()) if open_positions else 'Idle'}</div></div>
   <div class="card"><div class="label">Today's Trades</div><div class="value">{trade_today}</div><div class="sub-val">Total: {len(trades)}</div></div>
   <div class="card"><div class="label">Session</div><div class="value" style="font-size:16px">{current_session or 'Off-Hours'}</div><div class="sub-val">BTC 1H: {scan.get('btc_1h_change',0):+.2f}%</div></div>
@@ -728,17 +731,25 @@ def get_btc_crash(exchange: ccxt.binanceusdm) -> dict:
 #  SIGNAL DETECTION — MOMENTUM BREAKOUT
 # ─────────────────────────────────────────────
 
-def detect_consolidation(ohlcv_15m: list) -> tuple[bool, float, float, str]:
+def detect_consolidation(ohlcv_15m: list) -> tuple[bool, float, float, float, str]:
     """
-    Find the tightest consolidation in the last 12–20 candles.
+    Find the tightest valid consolidation in the last 12–20 candles.
     Excludes the last 3 candles (potential breakout area).
-    Returns (found, range_high, range_low, desc).
+
+    Range tiers:
+      > 8%       → hard skip
+      6–8%       → valid but weak  (quality=0.5)
+      3–5%       → preferred tight (quality=1.0)
+      < 3%       → too tight, may be noise — still valid (quality=0.8)
+
+    Returns (found, range_high, range_low, range_pct, desc).
+    Picks the setup with the best quality score (tightest preferred range wins).
     """
     n = len(ohlcv_15m)
     if n < CONSOL_LOOKBACK_MIN + 5:
-        return False, 0.0, 0.0, "insufficient data"
+        return False, 0.0, 0.0, 0.0, "insufficient data"
 
-    best: tuple | None = None
+    best: tuple | None = None   # (range_high, range_low, range_pct, lookback, quality)
 
     for lookback in range(CONSOL_LOOKBACK_MIN, min(CONSOL_LOOKBACK_MAX + 1, n - 2)):
         candles = ohlcv_15m[-(lookback + 3):-3]
@@ -752,17 +763,28 @@ def detect_consolidation(ohlcv_15m: list) -> tuple[bool, float, float, str]:
 
         range_pct = (range_high - range_low) / range_low
 
-        if range_pct > CONSOL_MAX_RANGE_HARD:   # > 8% — hard skip
+        if range_pct > CONSOL_MAX_RANGE_HARD:   # > 8% → hard skip
             continue
-        if range_pct <= CONSOL_MAX_RANGE:        # ≤ 6% — valid
-            if best is None or range_pct < best[2]:
-                best = (range_high, range_low, range_pct, lookback)
+        if range_pct > CONSOL_MAX_RANGE:        # 6–8% → skip
+            continue
+
+        # Quality scoring — prefer 3–5%
+        if CONSOL_PREF_MIN <= range_pct <= CONSOL_PREF_MAX:
+            quality = 1.0   # ideal tight range
+        elif range_pct < CONSOL_PREF_MIN:
+            quality = 0.8   # very tight — valid but may be noise
+        else:
+            quality = 0.5   # 5–6% — allowed but weak
+
+        if best is None or quality > best[4] or (quality == best[4] and range_pct < best[2]):
+            best = (range_high, range_low, range_pct, lookback, quality)
 
     if best:
-        rh, rl, rp, lb = best
-        return True, rh, rl, f"Structure {lb}c range={rp:.1%}"
+        rh, rl, rp, lb, q = best
+        tier = "tight" if q == 1.0 else ("v.tight" if q == 0.8 else "loose")
+        return True, rh, rl, rp, f"Structure {lb}c range={rp:.1%} [{tier}]"
 
-    return False, 0.0, 0.0, "no consolidation found"
+    return False, 0.0, 0.0, 0.0, "no consolidation found"
 
 
 def detect_breakout(ohlcv_15m: list, range_high: float) -> tuple[bool, int, str]:
@@ -807,14 +829,16 @@ def detect_breakout(ohlcv_15m: list, range_high: float) -> tuple[bool, int, str]
     return False, 0, "no valid breakout in last 3 candles"
 
 
-def check_volume_surge(ohlcv_15m: list, bo_offset: int) -> tuple[bool, float]:
+def check_volume_surge(ohlcv_15m: list, bo_offset: int) -> tuple[bool, float, str]:
     """
     Compare volume at the breakout candle to the 20-period avg before it.
-    Returns (passed, rvol_ratio).
+    Hard minimum: 2x. Preferred: 2.5x+.
+    Returns (passed, rvol_ratio, tier).
+      tier = "strong" (≥2.5x) | "weak" (2–2.5x) | "fail" (<2x)
     """
     n = len(ohlcv_15m)
     if n < bo_offset + 22:
-        return False, 0.0
+        return False, 0.0, "fail"
 
     volumes = [float(c[5]) for c in ohlcv_15m]
     bo_vol  = volumes[-bo_offset]
@@ -822,10 +846,15 @@ def check_volume_surge(ohlcv_15m: list, bo_offset: int) -> tuple[bool, float]:
     avg_vol = sum(base) / len(base) if base else 0.0
 
     if avg_vol <= 0:
-        return False, 0.0
+        return False, 0.0, "fail"
 
-    rvol = bo_vol / avg_vol
-    return rvol >= VOLUME_SURGE_MIN, round(rvol, 2)
+    rvol = round(bo_vol / avg_vol, 2)
+
+    if rvol < VOLUME_SURGE_MIN:
+        return False, rvol, "fail"
+
+    tier = "strong" if rvol >= VOLUME_SURGE_PREF else "weak"
+    return True, rvol, tier
 
 
 def check_1h_move(exchange: ccxt.binanceusdm, symbol: str) -> tuple[bool, float]:
@@ -856,12 +885,17 @@ def compute_breakout_signal(
     LONG-only momentum breakout signal.
 
     Order of checks:
-      1. 1H move filter  — skip if ≥ 15% already moved
-      2. Consolidation   — 12–20 candles, range ≤ 6%
-      3. Breakout candle — close ≥ 0.5% above range, body ≥ 60%, wick ≤ 40%
-      4. Volume surge    — ≥ 2x 20-period average at breakout candle
+      1. 1H move filter  — skip if ≥ 15% already moved (late entry guard)
+      2. Consolidation   — 12–20 candles, range ≤ 6% (prefer 3–5%)
+      3. Breakout candle — within last 3 candles, close ≥ 0.5% above range,
+                           body ≥ 60%, upper wick ≤ 40%
+      4. Volume surge    — ≥ 2x hard min (prefer ≥ 2.5x)
 
-    On pass: calculates structure-based SL (below range low) and 2R/4R TP.
+    Priority score (0–2): used to rank signals when multiple fire same scan.
+      +1 if volume ≥ 2.5x (strong)
+      +1 if range 3–5% (tight)
+
+    TP1 = 2R (fixed), TP2 = trailing stop (TRAIL_CALLBACK_PCT%).
     Returns (passed, details).
     """
     details: dict = {"direction": "LONG", "blocks": [], "entry_reasons": [], "vol_24h": vol_24h}
@@ -870,39 +904,42 @@ def compute_breakout_signal(
         details["blocks"].append("insufficient candle data")
         return False, details
 
-    # 1. 1H move filter
+    # 1. 1H move filter — skip if ≥ 15% already moved
     skip_1h, move_1h = check_1h_move(exchange, symbol)
     details["move_1h_pct"] = move_1h
     if skip_1h:
-        details["blocks"].append(f"Already moved {move_1h:.1f}% in 1H")
+        details["blocks"].append(f"Already moved {move_1h:.1f}% in 1H — late entry")
         return False, details
 
     # 2. Consolidation (structure)
-    consol_ok, range_high, range_low, consol_desc = detect_consolidation(ohlcv_15m)
+    consol_ok, range_high, range_low, range_pct, consol_desc = detect_consolidation(ohlcv_15m)
     details["range_high"] = round(range_high, 8)
     details["range_low"]  = round(range_low, 8)
+    details["range_pct"]  = round(range_pct * 100, 2)
     if not consol_ok:
         details["blocks"].append(f"No structure: {consol_desc}")
         return False, details
     details["entry_reasons"].append(consol_desc)
 
-    # 3. Breakout candle
+    # 3. Breakout candle — must be within last MAX_ENTRY_DELAY (3) candles
     bo_ok, bo_offset, bo_desc = detect_breakout(ohlcv_15m, range_high)
     details["bo_offset"] = bo_offset
     if not bo_ok:
-        details["blocks"].append("No valid breakout in last 3 candles")
+        details["blocks"].append(f"No valid breakout in last {MAX_ENTRY_DELAY} candles")
         return False, details
     details["entry_reasons"].append(bo_desc)
 
-    # 4. Volume surge ≥ 2x
-    vol_ok, rvol = check_volume_surge(ohlcv_15m, bo_offset)
+    # 4. Volume surge — ≥ 2x hard min, prefer ≥ 2.5x
+    vol_ok, rvol, vol_tier = check_volume_surge(ohlcv_15m, bo_offset)
     details["rvol_ratio"] = rvol
+    details["vol_tier"]   = vol_tier
     if not vol_ok:
-        details["blocks"].append(f"Weak volume RVOL={rvol:.2f}x < {VOLUME_SURGE_MIN}x")
+        details["blocks"].append(f"Volume too low RVOL={rvol:.2f}x (min {VOLUME_SURGE_MIN}x)")
         return False, details
-    details["entry_reasons"].append(f"Volume {rvol:.1f}x")
+    vol_label = f"Volume {rvol:.1f}x ({'strong' if vol_tier == 'strong' else 'weak — prefer ≥2.5x'})"
+    details["entry_reasons"].append(vol_label)
 
-    # Calculate SL (structure-based) and TP (R-multiples)
+    # Calculate SL (structure-based) and TP
     price    = float(ohlcv_15m[-1][4])
     sl_price = round(range_low * (1 - SL_BUFFER_PCT), 8)
     R        = price - sl_price
@@ -912,17 +949,24 @@ def compute_breakout_signal(
         return False, details
 
     tp1_price = round(price + TP1_R * R, 8)
-    tp2_price = round(price + TP2_R * R, 8)
+    # TP2 = trailing stop — no fixed price target, callback set at execution
 
-    details["price"]   = round(price, 8)
-    details["sl"]      = sl_price
-    details["tp1"]     = tp1_price
-    details["tp2"]     = tp2_price
-    details["R"]       = round(R, 8)
-    details["sl_pct"]  = round((price - sl_price) / price * 100, 2)
-    details["tp1_pct"] = round((tp1_price - price) / price * 100, 2)
-    details["tp2_pct"] = round((tp2_price - price) / price * 100, 2)
-    details["size_mult"] = 1.0
+    details["price"]      = round(price, 8)
+    details["sl"]         = sl_price
+    details["tp1"]        = tp1_price
+    details["tp2"]        = None          # trailing — no fixed level
+    details["R"]          = round(R, 8)
+    details["sl_pct"]     = round((price - sl_price) / price * 100, 2)
+    details["tp1_pct"]    = round((tp1_price - price) / price * 100, 2)
+    details["size_mult"]  = 1.0
+
+    # Priority score for execution ranking (higher = better setup)
+    priority = 0
+    if vol_tier == "strong":                                    # ≥ 2.5x volume
+        priority += 1
+    if CONSOL_PREF_MIN <= range_pct <= CONSOL_PREF_MAX:        # 3–5% tight range
+        priority += 1
+    details["priority"] = priority
 
     return True, details
 
@@ -964,7 +1008,7 @@ def open_long(
     details: dict,
     session: str,
 ) -> bool:
-    """Execute LONG with structure-based SL and 2R/4R TP. Returns True on success."""
+    """Execute LONG with structure-based SL, TP1=2R, TP2=trailing stop. Returns True on success."""
     price      = details.get("price", 0.0)
     sl_price   = details.get("sl", 0.0)
     conditions = details.get("entry_reasons", [])
@@ -985,49 +1029,47 @@ def open_long(
         entry_price = float(order.get("average") or price)
         order_id    = order.get("id", "N/A")
 
-        # Recalculate TP from actual fill (keep structure SL)
+        # Recalculate TP1 from actual fill (keep structure SL)
         R         = entry_price - sl_price
         tp1_price = round(entry_price + TP1_R * R, 8)
-        tp2_price = round(entry_price + TP2_R * R, 8)
 
         # SL — closes entire position
         exchange.create_order(
             symbol=symbol, type="stop_market", side="sell", amount=qty,
             params={"stopPrice": sl_price, "closePosition": True},
         )
-        # TP1 — half at 2R
+        # TP1 — half position at 2R
         exchange.create_order(
             symbol=symbol, type="take_profit_market", side="sell",
             amount=round(qty / 2, 6),
             params={"stopPrice": tp1_price, "reduceOnly": True},
         )
-        # TP2 — remaining half at 4R
+        # TP2 — trailing stop on remaining half (callback = TRAIL_CALLBACK_PCT%)
         exchange.create_order(
-            symbol=symbol, type="take_profit_market", side="sell",
+            symbol=symbol, type="trailing_stop_market", side="sell",
             amount=round(qty / 2, 6),
-            params={"stopPrice": tp2_price, "reduceOnly": True},
+            params={"callbackRate": TRAIL_CALLBACK_PCT, "reduceOnly": True},
         )
 
         open_positions[symbol] = {
             "direction": "LONG", "entry": entry_price, "qty": qty,
-            "sl": sl_price, "tp1": tp1_price, "tp2": tp2_price,
+            "sl": sl_price, "tp1": tp1_price, "tp2": "trailing",
             "order_id": order_id, "opened_at": datetime.now(timezone.utc).isoformat(),
         }
 
         entry_reasons = ", ".join(conditions)
         db_log_trade(
             _current_scan_id, symbol, entry_price, sl_price,
-            tp1_price, tp2_price, qty, rvol, entry_reasons,
+            tp1_price, 0.0, qty, rvol, entry_reasons,   # tp2=0 = trailing
         )
 
         sl_pct  = round((entry_price - sl_price) / entry_price * 100, 2)
         tp1_pct = round((tp1_price - entry_price) / entry_price * 100, 2)
-        tp2_pct = round((tp2_price - entry_price) / entry_price * 100, 2)
         cond_text = "\n".join(f"  ✓ {c}" for c in conditions)
 
         log.info(
             f"LONG opened: {symbol} @ {entry_price} | SL={sl_price}(-{sl_pct:.1f}%) "
-            f"TP1={tp1_price}(+{tp1_pct:.1f}%) TP2={tp2_price}(+{tp2_pct:.1f}%) RVOL={rvol:.1f}x"
+            f"TP1={tp1_price}(+{tp1_pct:.1f}%) TP2=trailing({TRAIL_CALLBACK_PCT}%) RVOL={rvol:.1f}x"
         )
         send_telegram(
             f"*MUESA — LONG OPENED* ⚡\n"
@@ -1038,7 +1080,7 @@ def open_long(
             f"Qty     : `{qty}`\n"
             f"SL      : `{sl_price}` (-{sl_pct:.1f}%) ← range low\n"
             f"TP1     : `{tp1_price}` (+{tp1_pct:.1f}%) ← 2R\n"
-            f"TP2     : `{tp2_price}` (+{tp2_pct:.1f}%) ← 4R\n"
+            f"TP2     : Trailing stop ({TRAIL_CALLBACK_PCT}% callback) ← rides momentum\n"
             f"─────────────────────\n"
             f"*Breakout Conditions*\n{cond_text}\n"
             f"─────────────────────\n"
@@ -1211,6 +1253,7 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
 
     signals_found = 0
     trades_taken  = 0
+    candidates: list[tuple[int, float, str, dict]] = []  # (priority, rvol, symbol, details)
 
     for symbol, vol_24h in symbol_vols:
 
@@ -1243,24 +1286,38 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
             continue
 
         signals_found += 1
+        priority = details.get("priority", 0)
+        rvol     = details.get("rvol_ratio", 0.0)
+        rng_pct  = details.get("range_pct", 0.0)
         log.info(
-            f"✅ SIGNAL: {symbol} [LONG BREAKOUT] | "
-            f"RVOL={details.get('rvol_ratio',0):.1f}x | "
-            f"SL=-{details.get('sl_pct',0):.1f}% TP1=+{details.get('tp1_pct',0):.1f}% TP2=+{details.get('tp2_pct',0):.1f}% | "
-            f"[{', '.join(details.get('entry_reasons',[]))}]"
+            f"✅ SIGNAL: {symbol} | RVOL={rvol:.1f}x [{details.get('vol_tier','?')}] | "
+            f"range={rng_pct:.1f}% | SL=-{details.get('sl_pct',0):.1f}% "
+            f"TP1=+{details.get('tp1_pct',0):.1f}% TP2=trailing | "
+            f"priority={priority}/2 | [{', '.join(details.get('entry_reasons',[]))}]"
         )
-        db_mark_signal(row_id, f"Breakout RVOL={details.get('rvol_ratio',0):.1f}x")
+        db_mark_signal(row_id, f"Breakout RVOL={rvol:.1f}x priority={priority}/2")
+        candidates.append((priority, rvol, symbol, details))
 
+    # Sort: highest priority first, then highest RVOL as tiebreaker
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    if candidates:
+        best = candidates[0]
+        log.info(
+            f"Best signal: {best[2]} priority={best[0]}/2 RVOL={best[1]:.1f}x "
+            f"(from {len(candidates)} candidate{'s' if len(candidates) > 1 else ''})"
+        )
+
+    if trading_paused:
+        log.info("Trading PAUSED — signals logged, not executed.")
+
+    for priority, rvol, symbol, details in candidates[:1]:
         if trading_paused:
-            log.info("Trading PAUSED — signal logged, not executed.")
-            continue
-
+            break
         if symbol in open_positions:
             continue
-
         if open_long(exchange, symbol, details, session):
             trades_taken += 1
-            break  # 1 trade per scan
 
     db_finish_scan(_current_scan_id, len(symbol_vols), signals_found, trades_taken)
     log.info(f"=== Scan complete | signals={signals_found} trades={trades_taken} ===")
@@ -1277,7 +1334,7 @@ def main() -> None:
     send_telegram(
         "*MUESA v3.0* — Momentum Breakout System\n"
         "Strategy: Structure + Volume + Breakout | LONG only | No AI\n"
-        f"RVOL≥{VOLUME_SURGE_MIN}x · Range≤{CONSOL_MAX_RANGE:.0%} · TP1={TP1_R:.0f}R / TP2={TP2_R:.0f}R\n"
+        f"RVOL≥{VOLUME_SURGE_MIN}x (pref≥{VOLUME_SURGE_PREF}x) · Range 3–5% · TP1={TP1_R:.0f}R + Trailing({TRAIL_CALLBACK_PCT}%)\n"
         f"Dashboard: http://139.59.23.165:{DASHBOARD_PORT}"
     )
 
