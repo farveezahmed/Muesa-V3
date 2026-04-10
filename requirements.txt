@@ -1,4 +1,0 @@
-cd C:\Users\hiveb\OneDrive\Desktop\Muesa
-git add requirements.txt
-git commit -m "Add requirements.txt"
-git push
