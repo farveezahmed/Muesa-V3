@@ -59,9 +59,12 @@ CONSOL_PREF_MIN      = 0.03     # preferred range lower bound (3%)
 CONSOL_PREF_MAX      = 0.05     # preferred range upper bound (5%)
 MAX_ENTRY_DELAY      = 3        # max candles after breakout to still enter
 MOVE_FILTER_1H_PCT   = 0.15     # skip if already moved ≥ 15% in last 1H
+MAX_CHASE_PCT        = 0.03     # skip if current price > 3% above breakout candle close
+TREND_SMA_PERIOD     = 20       # 1H SMA period for trend filter
+TREND_TOLERANCE      = 0.01     # allow up to 1% below SMA (not too strict)
 
 # ── Risk / Reward (structure-based SL)
-SL_BUFFER_PCT        = 0.002    # SL placed 0.2% below range low
+SL_BUFFER_PCT        = 0.002    # SL placed 0.2% below breakout candle low
 TP1_R                = 2.0      # TP1 at 2R → move SL to breakeven
 TRAIL_CALLBACK_PCT   = 2.0      # TP2 trailing stop callback % (replaces fixed 4R)
 
@@ -875,6 +878,25 @@ def check_1h_move(exchange: ccxt.binanceusdm, symbol: str) -> tuple[bool, float]
     return False, 0.0
 
 
+def check_1h_trend(exchange: ccxt.binanceusdm, symbol: str) -> bool:
+    """
+    Lenient 1H trend filter.
+    True  = price is at or above 1H SMA20 (bullish bias) — allow entry.
+    False = price is more than 1% below SMA20 — skip (counter-trend).
+    On any fetch error → default True (don't block trade).
+    """
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, "1h", limit=TREND_SMA_PERIOD + 5)
+        if len(ohlcv) < TREND_SMA_PERIOD:
+            return True   # not enough data — allow
+        closes  = [float(c[4]) for c in ohlcv]
+        sma20   = sum(closes[-TREND_SMA_PERIOD:]) / TREND_SMA_PERIOD
+        current = closes[-1]
+        return current >= sma20 * (1 - TREND_TOLERANCE)   # within 1% below SMA = still OK
+    except Exception:
+        return True   # default allow on error
+
+
 def compute_breakout_signal(
     exchange: ccxt.binanceusdm,
     symbol: str,
@@ -911,7 +933,13 @@ def compute_breakout_signal(
         details["blocks"].append(f"Already moved {move_1h:.1f}% in 1H — late entry")
         return False, details
 
-    # 2. Consolidation (structure)
+    # 2. 1H trend filter — price must be at/above 1H SMA20 (1% tolerance)
+    if not check_1h_trend(exchange, symbol):
+        details["blocks"].append("1H trend bearish — price below SMA20")
+        return False, details
+    details["entry_reasons"].append("1H trend: bullish")
+
+    # 3. Consolidation (structure)
     consol_ok, range_high, range_low, range_pct, consol_desc = detect_consolidation(ohlcv_15m)
     details["range_high"] = round(range_high, 8)
     details["range_low"]  = round(range_low, 8)
@@ -921,7 +949,7 @@ def compute_breakout_signal(
         return False, details
     details["entry_reasons"].append(consol_desc)
 
-    # 3. Breakout candle — must be within last MAX_ENTRY_DELAY (3) candles
+    # 4. Breakout candle — must be within last MAX_ENTRY_DELAY (3) candles
     bo_ok, bo_offset, bo_desc = detect_breakout(ohlcv_15m, range_high)
     details["bo_offset"] = bo_offset
     if not bo_ok:
@@ -929,7 +957,25 @@ def compute_breakout_signal(
         return False, details
     details["entry_reasons"].append(bo_desc)
 
-    # 4. Volume surge — ≥ 2x hard min, prefer ≥ 2.5x
+    # 5. Retracement guard — if breakout was 2-3 candles ago, price must still hold above range
+    current_price = float(ohlcv_15m[-1][4])
+    if bo_offset > 1 and current_price < range_high * 0.998:
+        details["blocks"].append(
+            f"Breakout retraced — price {current_price:.4f} pulled back below range"
+        )
+        return False, details
+
+    # 6. Chase guard — don't enter if price ran >3% above breakout candle close
+    bo_close   = float(ohlcv_15m[-bo_offset][4])
+    chase_pct  = (current_price - bo_close) / bo_close if bo_close > 0 else 0
+    details["chase_pct"] = round(chase_pct * 100, 2)
+    if chase_pct > MAX_CHASE_PCT:
+        details["blocks"].append(
+            f"Price chased {chase_pct:.1%} above breakout close — too late to enter"
+        )
+        return False, details
+
+    # 7. Volume surge — ≥ 2x hard min, prefer ≥ 2.5x
     vol_ok, rvol, vol_tier = check_volume_surge(ohlcv_15m, bo_offset)
     details["rvol_ratio"] = rvol
     details["vol_tier"]   = vol_tier
@@ -939,10 +985,17 @@ def compute_breakout_signal(
     vol_label = f"Volume {rvol:.1f}x ({'strong' if vol_tier == 'strong' else 'weak — prefer ≥2.5x'})"
     details["entry_reasons"].append(vol_label)
 
-    # Calculate SL (structure-based) and TP
-    price    = float(ohlcv_15m[-1][4])
-    sl_price = round(range_low * (1 - SL_BUFFER_PCT), 8)
-    R        = price - sl_price
+    # SL — below breakout candle low (tight, realistic R)
+    # Floor: never lower than range_low - buffer
+    bo_candle  = ohlcv_15m[-bo_offset]
+    bo_low     = float(bo_candle[3])
+    sl_price   = round(bo_low * (1 - SL_BUFFER_PCT), 8)
+    sl_floor   = round(range_low * (1 - SL_BUFFER_PCT), 8)
+    if sl_price < sl_floor:
+        sl_price = sl_floor   # cap at range low as absolute floor
+
+    price = current_price
+    R     = price - sl_price
 
     if R <= 0:
         details["blocks"].append("Invalid R — price at or below SL")
