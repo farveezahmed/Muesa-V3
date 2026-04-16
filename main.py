@@ -68,6 +68,18 @@ SL_BUFFER_PCT        = 0.002    # SL placed 0.2% below breakout candle low
 TP1_R                = 2.0      # TP1 at 2R → move SL to breakeven
 TRAIL_CALLBACK_PCT   = 2.0      # TP2 trailing stop callback % (replaces fixed 4R)
 
+# ── Position sizing (risk-based)
+RISK_PER_TRADE_PCT   = 0.01     # risk 1% of free balance per trade
+MAX_NOTIONAL_PCT     = 0.40     # cap notional at 40% of balance * leverage
+
+# ── Drawdown guards
+MAX_DAILY_SL_HITS    = 3        # stop trading for the day after 3 SL hits
+MAX_CONSEC_LOSSES    = 2        # reduce size after N consecutive SL hits
+CONSEC_LOSS_MULT     = 0.5      # size multiplier when on losing streak
+
+# ── BTC momentum filter
+BTC_MOMENTUM_RVOL    = 1.5      # skip entry if BTC 15m is bearish + RVOL ≥ this
+
 # ── Guards
 SL_COOLDOWN_HOURS    = 24
 BTC_CRASH_1H_PCT     = 0.05
@@ -118,6 +130,8 @@ _current_scan_id: int            = -1
 last_weekly_calc_day: int        = -1
 trading_paused: bool             = False
 scanning_paused: bool            = False
+consecutive_losses: int          = 0    # resets on any win
+daily_sl_count: int              = 0    # resets at midnight
 
 # ─────────────────────────────────────────────
 #  DATABASE
@@ -730,6 +744,29 @@ def get_btc_crash(exchange: ccxt.binanceusdm) -> dict:
         log.error(f"BTC crash check failed: {e}")
     return ctx
 
+def btc_momentum_bearish(exchange: ccxt.binanceusdm) -> bool:
+    """
+    Returns True if BTC last 15m candle is bearish AND volume surge ≥ BTC_MOMENTUM_RVOL.
+    Signals active BTC selling — bad timing for altcoin LONGs.
+    Default: False (allow) on any error.
+    """
+    try:
+        ohlcv = exchange.fetch_ohlcv("BTC/USDT:USDT", "15m", limit=25)
+        if len(ohlcv) < 22:
+            return False
+        last   = ohlcv[-1]
+        open_  = float(last[1])
+        close  = float(last[4])
+        if close >= open_:       # bullish candle — fine
+            return False
+        vols   = [float(c[5]) for c in ohlcv]
+        avg    = sum(vols[-21:-1]) / 20
+        rvol   = vols[-1] / avg if avg > 0 else 0
+        return rvol >= BTC_MOMENTUM_RVOL
+    except Exception:
+        return False             # default: don't block on error
+
+
 # ─────────────────────────────────────────────
 #  SIGNAL DETECTION — MOMENTUM BREAKOUT
 # ─────────────────────────────────────────────
@@ -979,6 +1016,11 @@ def compute_breakout_signal(
     vol_label = f"Volume {rvol:.1f}x ({'strong' if vol_tier == 'strong' else 'weak — prefer ≥2.5x'})"
     details["entry_reasons"].append(vol_label)
 
+    # 7. BTC momentum — skip if BTC 15m is bearish with high RVOL
+    if btc_momentum_bearish(exchange):
+        details["blocks"].append("BTC selling hard — skip altcoin LONG")
+        return False, details
+
     # SL — below breakout candle low (tight, realistic R)
     # Floor: never lower than range_low - buffer
     bo_candle  = ohlcv_15m[-bo_offset]
@@ -1005,7 +1047,11 @@ def compute_breakout_signal(
     details["R"]          = round(R, 8)
     details["sl_pct"]     = round((price - sl_price) / price * 100, 2)
     details["tp1_pct"]    = round((tp1_price - price) / price * 100, 2)
-    details["size_mult"]  = 1.0
+    # Reduce size on losing streak
+    size_mult = CONSEC_LOSS_MULT if consecutive_losses >= MAX_CONSEC_LOSSES else 1.0
+    details["size_mult"] = size_mult
+    if size_mult < 1.0:
+        details["entry_reasons"].append(f"⚠ Reduced size ({int(size_mult*100)}%) — {consecutive_losses} consec losses")
 
     # Priority score for execution ranking (higher = better setup)
     priority = 0
@@ -1022,14 +1068,25 @@ def compute_breakout_signal(
 # ─────────────────────────────────────────────
 
 def get_position_size(exchange: ccxt.binanceusdm, symbol: str, price: float,
-                      size_mult: float = 1.0) -> float:
+                      sl_price: float, size_mult: float = 1.0) -> float:
+    """
+    Risk-based sizing: risk RISK_PER_TRADE_PCT of free balance per trade.
+    qty = risk_usdt / sl_distance  (independent of leverage on loss calculation)
+    Capped at MAX_NOTIONAL_PCT * balance * leverage to prevent oversizing.
+    """
     try:
-        balance   = exchange.fetch_balance()
-        usdt_free = float(balance["USDT"]["free"])
-        notional  = usdt_free * WALLET_ALLOC_PCT * size_mult * LEVERAGE
-        qty       = notional / price
-        market    = exchange.market(symbol)
-        step      = float(market.get("precision", {}).get("amount", 0.001))
+        balance      = exchange.fetch_balance()
+        usdt_free    = float(balance["USDT"]["free"])
+        sl_distance  = price - sl_price
+        if sl_distance <= 0:
+            return 0.0
+        risk_usdt    = usdt_free * RISK_PER_TRADE_PCT * size_mult
+        qty          = risk_usdt / sl_distance
+        # Cap notional
+        max_qty      = (usdt_free * MAX_NOTIONAL_PCT * LEVERAGE) / price
+        qty          = min(qty, max_qty)
+        market       = exchange.market(symbol)
+        step         = float(market.get("precision", {}).get("amount", 0.001))
         if step > 0:
             qty = math.floor(qty / step) * step
         return round(qty, 6)
@@ -1065,7 +1122,7 @@ def open_long(
         log.warning(f"Invalid price/SL for {symbol}")
         return False
 
-    qty = get_position_size(exchange, symbol, price, details.get("size_mult", 1.0))
+    qty = get_position_size(exchange, symbol, price, sl_price, details.get("size_mult", 1.0))
     if qty <= 0:
         log.warning(f"Invalid qty for {symbol}")
         return False
@@ -1080,11 +1137,13 @@ def open_long(
         R         = entry_price - sl_price
         tp1_price = round(entry_price + TP1_R * R, 8)
 
-        # SL — closes entire position
-        exchange.create_order(
+        # SL — store order ID for breakeven move later
+        sl_order = exchange.create_order(
             symbol=symbol, type="stop_market", side="sell", amount=qty,
             params={"stopPrice": sl_price, "closePosition": True},
         )
+        sl_order_id = sl_order.get("id", "N/A")
+
         # TP1 — half position at 2R
         exchange.create_order(
             symbol=symbol, type="take_profit_market", side="sell",
@@ -1101,7 +1160,9 @@ def open_long(
         open_positions[symbol] = {
             "direction": "LONG", "entry": entry_price, "qty": qty,
             "sl": sl_price, "tp1": tp1_price, "tp2": "trailing",
-            "order_id": order_id, "opened_at": datetime.now(timezone.utc).isoformat(),
+            "order_id": order_id, "sl_order_id": sl_order_id,
+            "breakeven_set": False,
+            "opened_at": datetime.now(timezone.utc).isoformat(),
         }
 
         entry_reasons = ", ".join(conditions)
@@ -1125,7 +1186,7 @@ def open_long(
             f"Session : `{session}`\n"
             f"Entry   : `{entry_price}`\n"
             f"Qty     : `{qty}`\n"
-            f"SL      : `{sl_price}` (-{sl_pct:.1f}%) ← range low\n"
+            f"SL      : `{sl_price}` (-{sl_pct:.1f}%) ← bo candle low\n"
             f"TP1     : `{tp1_price}` (+{tp1_pct:.1f}%) ← 2R\n"
             f"TP2     : Trailing stop ({TRAIL_CALLBACK_PCT}% callback) ← rides momentum\n"
             f"─────────────────────\n"
@@ -1174,7 +1235,34 @@ def position_monitor_loop(exchange: ccxt.binanceusdm) -> None:
             sync_open_positions(exchange)
 
 
+def _move_sl_to_breakeven(exchange: ccxt.binanceusdm, symbol: str, pos: dict) -> None:
+    """Cancel original SL and place new SL at entry price (breakeven). Called once after TP1 hit."""
+    try:
+        entry       = float(pos.get("entry") or 0)
+        sl_order_id = pos.get("sl_order_id")
+        qty_half    = round(float(pos.get("qty", 0)) / 2, 6)
+        if not entry or not sl_order_id or qty_half <= 0:
+            return
+        # Cancel old SL
+        try:
+            exchange.cancel_order(sl_order_id, symbol)
+        except Exception:
+            pass   # already triggered — that's OK, new SL will still be placed
+        # New SL at entry (breakeven) — reduce-only for remaining half
+        exchange.create_order(
+            symbol=symbol, type="stop_market", side="sell", amount=qty_half,
+            params={"stopPrice": entry, "reduceOnly": True},
+        )
+        pos["sl"]            = entry
+        pos["breakeven_set"] = True
+        log.info(f"Breakeven set: {symbol} — SL moved to entry {entry}")
+        send_telegram(f"🔁 *Breakeven Set*\n`{symbol}` TP1 hit — SL moved to entry `{entry}` ✅")
+    except Exception as e:
+        log.warning(f"Breakeven move failed {symbol}: {e}")
+
+
 def sync_open_positions(exchange: ccxt.binanceusdm) -> None:
+    global consecutive_losses, daily_sl_count
     if not open_positions:
         return
     try:
@@ -1182,6 +1270,24 @@ def sync_open_positions(exchange: ccxt.binanceusdm) -> None:
             p["symbol"] for p in exchange.fetch_positions()
             if float(p.get("contracts") or 0) > 0
         }
+
+        # Breakeven check — for open positions still running
+        for sym, pos in list(open_positions.items()):
+            if sym not in live_symbols:
+                continue
+            if pos.get("breakeven_set"):
+                continue
+            tp1 = float(pos.get("tp1") or 0)
+            if tp1 <= 0:
+                continue
+            try:
+                last_price = float(exchange.fetch_ticker(sym).get("last") or 0)
+                if last_price >= tp1:
+                    _move_sl_to_breakeven(exchange, sym, pos)
+            except Exception as e:
+                log.warning(f"Breakeven check failed {sym}: {e}")
+
+        # Closed position detection
         for sym in [s for s in list(open_positions.keys()) if s not in live_symbols]:
             pos      = open_positions.pop(sym, {})
             entry    = float(pos.get("entry") or 0)
@@ -1189,12 +1295,20 @@ def sync_open_positions(exchange: ccxt.binanceusdm) -> None:
             try:
                 last_price = float(exchange.fetch_ticker(sym).get("last") or 0)
                 sl_hit     = last_price > 0 and sl_price > 0 and last_price <= sl_price * 1.001
-                if sl_hit:
+                if sl_hit and not pos.get("breakeven_set"):
+                    # Real SL hit — full loss
                     sl_hit_symbols[sym] = time.time()
+                    consecutive_losses += 1
+                    daily_sl_count     += 1
                     db_update_trade_status(sym, "sl_hit")
-                    send_telegram(f"🔴 *SL Hit*\n`{sym}` LONG | Entry: `{entry}` | SL: `{sl_price}`")
-                    log.info(f"SL hit: {sym} — {SL_COOLDOWN_HOURS}h cooldown")
+                    send_telegram(
+                        f"🔴 *SL Hit*\n`{sym}` LONG | Entry: `{entry}` | SL: `{sl_price}`\n"
+                        f"Consec losses: {consecutive_losses} | Today SL hits: {daily_sl_count}"
+                    )
+                    log.info(f"SL hit: {sym} — consec={consecutive_losses} daily={daily_sl_count}")
                 else:
+                    # Closed at TP or breakeven — reset consecutive losses
+                    consecutive_losses = 0
                     db_update_trade_status(sym, "closed")
                     send_telegram(f"✅ *Position Closed*\n`{sym}` LONG | Entry: `{entry}`")
             except Exception:
@@ -1225,10 +1339,11 @@ def get_top_symbols(exchange: ccxt.binanceusdm) -> list[tuple[str, float]]:
 # ─────────────────────────────────────────────
 
 def maybe_reset_daily(now: datetime) -> None:
-    global last_reset_day, last_weekly_calc_day
+    global last_reset_day, last_weekly_calc_day, daily_sl_count
     if now.day != last_reset_day:
-        last_reset_day = now.day
-        log.info("Daily reset.")
+        last_reset_day  = now.day
+        daily_sl_count  = 0    # reset daily SL counter at midnight
+        log.info("Daily reset — SL counter cleared.")
         if now.weekday() == 6 and now.day != last_weekly_calc_day:
             last_weekly_calc_day = now.day
             threading.Thread(target=db_calc_weekly_stats, daemon=True).start()
@@ -1359,6 +1474,12 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
     is_paused = db_get_state("trading_paused") == "1"
     if is_paused:
         log.info("Trading PAUSED — signals logged, no trades executed.")
+    elif daily_sl_count >= MAX_DAILY_SL_HITS:
+        log.info(f"Daily loss limit hit ({daily_sl_count} SL hits) — no more trades today.")
+        send_telegram(
+            f"🛑 *MUESA — Daily Limit Reached*\n"
+            f"{daily_sl_count} SL hits today. Trading stopped until midnight UTC."
+        ) if daily_sl_count == MAX_DAILY_SL_HITS else None
     else:
         for priority, rvol, symbol, details in candidates[:1]:
             if symbol in open_positions:
