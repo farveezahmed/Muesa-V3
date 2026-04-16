@@ -17,7 +17,7 @@ load_dotenv(override=True)
 
 import ccxt
 import requests
-from flask import Flask
+from flask import Flask, redirect
 
 # ─────────────────────────────────────────────
 #  CONFIGURATION
@@ -613,8 +613,8 @@ def toggle_trading():
     db_set_state("trading_paused", "1" if trading_paused else "0")
     state = "PAUSED" if trading_paused else "RESUMED"
     log.info(f"Trading {state} via dashboard.")
-    send_telegram(f"*MUESA — Trading {state}*\n{'No new trades.' if trading_paused else 'Execution active.'}")
-    return ("", 204)
+    send_telegram(f"*MUESA — Trading {state}*\n{'⏸ No new trades will open.' if trading_paused else '▶ Execution active.'}")
+    return redirect("/")
 
 @_flask_app.route("/toggle_scanning", methods=["POST"])
 def toggle_scanning():
@@ -933,13 +933,7 @@ def compute_breakout_signal(
         details["blocks"].append(f"Already moved {move_1h:.1f}% in 1H — late entry")
         return False, details
 
-    # 2. 1H trend filter — price must be at/above 1H SMA20 (1% tolerance)
-    if not check_1h_trend(exchange, symbol):
-        details["blocks"].append("1H trend bearish — price below SMA20")
-        return False, details
-    details["entry_reasons"].append("1H trend: bullish")
-
-    # 3. Consolidation (structure)
+    # 2. Consolidation (structure)
     consol_ok, range_high, range_low, range_pct, consol_desc = detect_consolidation(ohlcv_15m)
     details["range_high"] = round(range_high, 8)
     details["range_low"]  = round(range_low, 8)
@@ -949,7 +943,7 @@ def compute_breakout_signal(
         return False, details
     details["entry_reasons"].append(consol_desc)
 
-    # 4. Breakout candle — must be within last MAX_ENTRY_DELAY (3) candles
+    # 3. Breakout candle — must be within last MAX_ENTRY_DELAY (3) candles
     bo_ok, bo_offset, bo_desc = detect_breakout(ohlcv_15m, range_high)
     details["bo_offset"] = bo_offset
     if not bo_ok:
@@ -957,7 +951,7 @@ def compute_breakout_signal(
         return False, details
     details["entry_reasons"].append(bo_desc)
 
-    # 5. Retracement guard — if breakout was 2-3 candles ago, price must still hold above range
+    # 4. Retracement guard — if breakout was 2-3 candles ago, price must still hold above range
     current_price = float(ohlcv_15m[-1][4])
     if bo_offset > 1 and current_price < range_high * 0.998:
         details["blocks"].append(
@@ -965,7 +959,7 @@ def compute_breakout_signal(
         )
         return False, details
 
-    # 6. Chase guard — don't enter if price ran >3% above breakout candle close
+    # 5. Chase guard — don't enter if price ran >3% above breakout candle close
     bo_close   = float(ohlcv_15m[-bo_offset][4])
     chase_pct  = (current_price - bo_close) / bo_close if bo_close > 0 else 0
     details["chase_pct"] = round(chase_pct * 100, 2)
@@ -975,7 +969,7 @@ def compute_breakout_signal(
         )
         return False, details
 
-    # 7. Volume surge — ≥ 2x hard min, prefer ≥ 2.5x
+    # 6. Volume surge — ≥ 2x hard min, prefer ≥ 2.5x
     vol_ok, rvol, vol_tier = check_volume_surge(ohlcv_15m, bo_offset)
     details["rvol_ratio"] = rvol
     details["vol_tier"]   = vol_tier
@@ -1361,16 +1355,16 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
             f"(from {len(candidates)} candidate{'s' if len(candidates) > 1 else ''})"
         )
 
-    if trading_paused:
-        log.info("Trading PAUSED — signals logged, not executed.")
-
-    for priority, rvol, symbol, details in candidates[:1]:
-        if trading_paused:
-            break
-        if symbol in open_positions:
-            continue
-        if open_long(exchange, symbol, details, session):
-            trades_taken += 1
+    # Re-read pause state from DB — guarantees accuracy regardless of thread timing
+    is_paused = db_get_state("trading_paused") == "1"
+    if is_paused:
+        log.info("Trading PAUSED — signals logged, no trades executed.")
+    else:
+        for priority, rvol, symbol, details in candidates[:1]:
+            if symbol in open_positions:
+                continue
+            if open_long(exchange, symbol, details, session):
+                trades_taken += 1
 
     db_finish_scan(_current_scan_id, len(symbol_vols), signals_found, trades_taken)
     log.info(f"=== Scan complete | signals={signals_found} trades={trades_taken} ===")
