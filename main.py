@@ -80,6 +80,14 @@ CONSEC_LOSS_MULT     = 0.5      # size multiplier when on losing streak
 # ── BTC momentum filter
 BTC_MOMENTUM_RVOL    = 1.5      # skip entry if BTC 15m is bearish + RVOL ≥ this
 
+# ── Pattern 2 — Retest/Bounce
+RETEST_BO_MIN        = 4        # breakout must be ≥ 4 candles ago
+RETEST_BO_MAX        = 15       # breakout must be ≤ 15 candles ago
+RETEST_PRE_CANDLES   = 12       # candles before breakout used to define range
+RETEST_ZONE_PCT      = 0.005    # bounce candle low must be within 0.5% above range_high
+RETEST_BODY_MIN      = 0.50     # bounce candle body ≥ 50% of its range
+RETEST_VOL_MIN       = 1.5      # volume on bounce candle ≥ 1.5x average
+
 # ── Guards
 SL_COOLDOWN_HOURS    = 24
 BTC_CRASH_1H_PCT     = 0.05
@@ -869,6 +877,115 @@ def detect_breakout(ohlcv_15m: list, range_high: float) -> tuple[bool, int, str]
     return False, 0, "no valid breakout in last 3 candles"
 
 
+def detect_retest_bounce(ohlcv_15m: list) -> tuple[bool, dict]:
+    """
+    Pattern 2 detection — Retest/Bounce.
+
+    Sequence required:
+      [A] A bullish breakout candle occurred 4–15 candles ago, closing ≥0.5%
+          above the range_high of the RETEST_PRE_CANDLES candles before it.
+      [B] After that breakout, at least one candle pulled back close to range_high
+          (candle low ≤ range_high × 1.005).
+      [C] A recent candle (offset 1–3) is bullish, touched range_high zone,
+          body ≥ 50%, and did not close more than 4% above range_high (no chasing).
+
+    Returns (found, info_dict).
+    info_dict keys: range_high, range_low, range_pct, bounce_low, bounce_offset, bo_offset, desc
+    """
+    n = len(ohlcv_15m)
+    _empty = {"range_high": 0, "range_low": 0, "range_pct": 0,
+              "bounce_low": 0, "bounce_offset": 0, "bo_offset": 0, "desc": ""}
+
+    if n < RETEST_BO_MAX + RETEST_PRE_CANDLES + 5:
+        return False, {**_empty, "desc": "insufficient data for retest scan"}
+
+    for bo_offset in range(RETEST_BO_MIN, min(RETEST_BO_MAX + 1, n - RETEST_PRE_CANDLES - 3)):
+
+        # ── [A] Historical breakout candle ─────────────────────────────────────
+        bo_c   = ohlcv_15m[-bo_offset]
+        bo_open  = float(bo_c[1])
+        bo_close = float(bo_c[4])
+
+        if bo_close <= bo_open:          # must be bullish
+            continue
+
+        # Range = RETEST_PRE_CANDLES candles immediately before the breakout candle
+        pre_start = -(bo_offset + RETEST_PRE_CANDLES)
+        pre_end   = -bo_offset
+        pre_candles = ohlcv_15m[pre_start:pre_end]
+        if len(pre_candles) < 8:
+            continue
+
+        range_high = max(float(c[2]) for c in pre_candles)
+        range_low  = min(float(c[3]) for c in pre_candles)
+        if range_low <= 0 or range_high <= 0:
+            continue
+
+        range_pct  = (range_high - range_low) / range_low
+        if range_pct > CONSOL_MAX_RANGE:   # >6% = too wide
+            continue
+        if range_pct < 0.01:               # <1% = noise / no real range
+            continue
+
+        # Breakout must close ≥ BREAKOUT_MIN_PCT above range_high
+        bo_pct = (bo_close - range_high) / range_high
+        if bo_pct < BREAKOUT_MIN_PCT:
+            continue
+
+        # ── [B] Pullback — at least one post-breakout candle retested range_high ─
+        # Candles after the breakout = ohlcv_15m[-(bo_offset - 1):]
+        # Python slice: bo_offset - 1 candles from the end
+        post_bo = ohlcv_15m[-(bo_offset - 1):]    # candles after breakout up to now
+        pullback_seen = any(
+            float(c[3]) <= range_high * (1 + RETEST_ZONE_PCT)
+            for c in post_bo
+        )
+        if not pullback_seen:
+            continue
+
+        # ── [C] Bounce candle — last 1–3 candles ──────────────────────────────
+        for bounce_offset in range(1, 4):
+            if n < bounce_offset + 1:
+                break
+
+            bc     = ohlcv_15m[-bounce_offset]
+            b_open  = float(bc[1])
+            b_high  = float(bc[2])
+            b_low   = float(bc[3])
+            b_close = float(bc[4])
+
+            if b_close <= b_open:                           # must be bullish
+                continue
+            if b_low > range_high * (1 + RETEST_ZONE_PCT): # must touch the level
+                continue
+            if b_close > range_high * 1.04:                # too far above — chasing
+                continue
+
+            b_rng = b_high - b_low
+            if b_rng <= 0:
+                continue
+
+            body_pct = abs(b_close - b_open) / b_rng
+            if body_pct < RETEST_BODY_MIN:                  # body < 50%
+                continue
+
+            # Valid retest bounce found
+            return True, {
+                "range_high":    range_high,
+                "range_low":     range_low,
+                "range_pct":     range_pct,
+                "bounce_low":    b_low,
+                "bounce_offset": bounce_offset,
+                "bo_offset":     bo_offset,
+                "desc": (
+                    f"Retest {range_high:.4f} | bo={bo_offset}c ago "
+                    f"body={body_pct:.0%} range={range_pct:.1%}"
+                ),
+            }
+
+    return False, {**_empty, "desc": "no retest pattern found"}
+
+
 def check_volume_surge(ohlcv_15m: list, bo_offset: int) -> tuple[bool, float, str]:
     """
     Compare volume at the breakout candle to the 20-period avg before it.
@@ -1063,6 +1180,141 @@ def compute_breakout_signal(
 
     return True, details
 
+
+def compute_retest_signal(
+    exchange: ccxt.binanceusdm,
+    symbol: str,
+    vol_24h: float,
+    ohlcv_15m: list,
+) -> tuple[bool, dict]:
+    """
+    Pattern 2 — Retest/Bounce LONG entry.
+
+    Enter when price pulls back to the breakout level (old range_high)
+    and shows a confirmed bullish bounce with volume support.
+
+    Advantages over Pattern 1:
+      - Range_high becomes confirmed support → lower fakeout risk
+      - SL tighter (below bounce candle low only)
+      - Better R:R on average
+
+    Priority base = 1 (confirmed support adds inherent quality).
+    +1 if bounce volume ≥ 2.5x (very strong confirmation).
+    """
+    details: dict = {
+        "direction": "LONG",
+        "pattern":   "retest",
+        "blocks":    [],
+        "entry_reasons": [],
+        "vol_24h":   vol_24h,
+    }
+
+    if len(ohlcv_15m) < RETEST_BO_MAX + RETEST_PRE_CANDLES + 5:
+        details["blocks"].append("insufficient data for retest scan")
+        return False, details
+
+    # 1. 1H move filter — same as Pattern 1
+    skip_1h, move_1h = check_1h_move(exchange, symbol)
+    details["move_1h_pct"] = move_1h
+    if skip_1h:
+        details["blocks"].append(f"Already moved {move_1h:.1f}% in 1H — late entry")
+        return False, details
+
+    # 2. Retest pattern detection
+    found, rt = detect_retest_bounce(ohlcv_15m)
+    if not found:
+        details["blocks"].append(f"No retest: {rt['desc']}")
+        return False, details
+
+    range_high    = rt["range_high"]
+    range_low     = rt["range_low"]
+    range_pct     = rt["range_pct"]
+    bounce_low    = rt["bounce_low"]
+    bounce_offset = rt["bounce_offset"]
+    bo_offset     = rt["bo_offset"]
+
+    details["range_high"]    = round(range_high, 8)
+    details["range_low"]     = round(range_low, 8)
+    details["range_pct"]     = round(range_pct * 100, 2)
+    details["bo_offset"]     = bo_offset
+    details["bounce_offset"] = bounce_offset
+    details["entry_reasons"].append(rt["desc"])
+
+    # 3. Chase guard — current price must not be >3% above range_high
+    current_price = float(ohlcv_15m[-1][4])
+    chase_pct     = (current_price - range_high) / range_high if range_high > 0 else 0
+    details["chase_pct"] = round(chase_pct * 100, 2)
+    if chase_pct > MAX_CHASE_PCT:
+        details["blocks"].append(
+            f"Price {chase_pct:.1%} above retest level — too late"
+        )
+        return False, details
+
+    # 4. Volume on bounce candle ≥ RETEST_VOL_MIN (1.5x) — less strict than Pattern 1
+    _, rvol, _ = check_volume_surge(ohlcv_15m, bounce_offset)
+    details["rvol_ratio"] = rvol
+    if rvol < RETEST_VOL_MIN:
+        details["blocks"].append(
+            f"Bounce volume too weak RVOL={rvol:.2f}x (min {RETEST_VOL_MIN}x)"
+        )
+        return False, details
+    vol_tier = "strong" if rvol >= VOLUME_SURGE_PREF else "weak"
+    details["vol_tier"] = vol_tier
+    details["entry_reasons"].append(
+        f"Bounce vol {rvol:.1f}x ({'strong' if vol_tier == 'strong' else 'acceptable ≥1.5x'})"
+    )
+
+    # 5. BTC momentum — same guard as Pattern 1
+    if btc_momentum_bearish(exchange):
+        details["blocks"].append("BTC selling hard — skip altcoin LONG")
+        return False, details
+
+    # SL — below bounce candle low (very tight R)
+    sl_price  = round(bounce_low * (1 - SL_BUFFER_PCT), 8)
+    sl_floor  = round(range_low  * (1 - SL_BUFFER_PCT), 8)
+    if sl_price < sl_floor:
+        sl_price = sl_floor  # absolute floor: never below range_low
+
+    price = current_price
+    R     = price - sl_price
+
+    if R <= 0:
+        details["blocks"].append("Invalid R — price at or below SL")
+        return False, details
+
+    # Sanity: SL must be at least 0.3% below entry (avoid dust SL)
+    min_r = price * 0.003
+    if R < min_r:
+        sl_price = round(price * (1 - 0.003), 8)
+        R        = price - sl_price
+
+    tp1_price = round(price + TP1_R * R, 8)
+
+    details["price"]     = round(price, 8)
+    details["sl"]        = sl_price
+    details["tp1"]       = tp1_price
+    details["tp2"]       = None
+    details["R"]         = round(R, 8)
+    details["sl_pct"]    = round((price - sl_price) / price * 100, 2)
+    details["tp1_pct"]   = round((tp1_price - price) / price * 100, 2)
+
+    # Consecutive loss size reduction
+    size_mult = CONSEC_LOSS_MULT if consecutive_losses >= MAX_CONSEC_LOSSES else 1.0
+    details["size_mult"] = size_mult
+    if size_mult < 1.0:
+        details["entry_reasons"].append(
+            f"⚠ Reduced size ({int(size_mult*100)}%) — {consecutive_losses} consec losses"
+        )
+
+    # Priority: retest base=1 (confirmed support) + 1 if strong bounce volume
+    priority = 1
+    if vol_tier == "strong":
+        priority += 1
+    details["priority"] = priority
+
+    return True, details
+
+
 # ─────────────────────────────────────────────
 #  POSITION SIZING
 # ─────────────────────────────────────────────
@@ -1171,26 +1423,31 @@ def open_long(
             tp1_price, 0.0, qty, rvol, entry_reasons,   # tp2=0 = trailing
         )
 
-        sl_pct  = round((entry_price - sl_price) / entry_price * 100, 2)
-        tp1_pct = round((tp1_price - entry_price) / entry_price * 100, 2)
+        sl_pct    = round((entry_price - sl_price) / entry_price * 100, 2)
+        tp1_pct   = round((tp1_price - entry_price) / entry_price * 100, 2)
         cond_text = "\n".join(f"  ✓ {c}" for c in conditions)
+        pattern   = details.get("pattern", "breakout")
+        p_emoji   = "🔁" if pattern == "retest" else "⚡"
+        sl_label  = "bounce candle low" if pattern == "retest" else "bo candle low"
 
         log.info(
-            f"LONG opened: {symbol} @ {entry_price} | SL={sl_price}(-{sl_pct:.1f}%) "
-            f"TP1={tp1_price}(+{tp1_pct:.1f}%) TP2=trailing({TRAIL_CALLBACK_PCT}%) RVOL={rvol:.1f}x"
+            f"LONG [{pattern.upper()}] opened: {symbol} @ {entry_price} | "
+            f"SL={sl_price}(-{sl_pct:.1f}%) TP1={tp1_price}(+{tp1_pct:.1f}%) "
+            f"TP2=trailing({TRAIL_CALLBACK_PCT}%) RVOL={rvol:.1f}x"
         )
         send_telegram(
-            f"*MUESA — LONG OPENED* ⚡\n"
+            f"*MUESA — LONG OPENED* {p_emoji}\n"
             f"─────────────────────\n"
+            f"Pattern : `{pattern.upper()}`\n"
             f"Symbol  : `{symbol}`\n"
             f"Session : `{session}`\n"
             f"Entry   : `{entry_price}`\n"
             f"Qty     : `{qty}`\n"
-            f"SL      : `{sl_price}` (-{sl_pct:.1f}%) ← bo candle low\n"
+            f"SL      : `{sl_price}` (-{sl_pct:.1f}%) ← {sl_label}\n"
             f"TP1     : `{tp1_price}` (+{tp1_pct:.1f}%) ← 2R\n"
-            f"TP2     : Trailing stop ({TRAIL_CALLBACK_PCT}% callback) ← rides momentum\n"
+            f"TP2     : Trailing stop ({TRAIL_CALLBACK_PCT}% callback)\n"
             f"─────────────────────\n"
-            f"*Breakout Conditions*\n{cond_text}\n"
+            f"*Entry Conditions*\n{cond_text}\n"
             f"─────────────────────\n"
             f"RVOL  : `{rvol:.1f}x`\n"
             f"Range : `{details.get('range_low',0):.4f}` → `{details.get('range_high',0):.4f}`"
@@ -1438,9 +1695,21 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
         except Exception as e:
             log.debug(f"OHLCV fetch failed {symbol}: {e}"); continue
 
-        # Run signal check
-        passed, details = compute_breakout_signal(exchange, symbol, vol_24h, ohlcv_15m)
-        block_reason    = ", ".join(details.get("blocks", [])) if not passed else ""
+        # ── Pattern 1: Breakout
+        p1_passed, p1_details = compute_breakout_signal(exchange, symbol, vol_24h, ohlcv_15m)
+
+        if p1_passed:
+            passed, details = True, p1_details
+        else:
+            # ── Pattern 2: Retest/Bounce (only tried if Pattern 1 fails)
+            p2_passed, p2_details = compute_retest_signal(exchange, symbol, vol_24h, ohlcv_15m)
+            if p2_passed:
+                passed, details = True, p2_details
+            else:
+                # Both failed — log Pattern 1 block reason (more informative)
+                passed, details = False, p1_details
+
+        block_reason = ", ".join(details.get("blocks", [])) if not passed else ""
         row_id = db_log_coin(_current_scan_id, symbol, details, not passed, block_reason)
 
         if not passed:
@@ -1448,16 +1717,17 @@ def run_scan(exchange: ccxt.binanceusdm, candle_close: datetime) -> None:
             continue
 
         signals_found += 1
+        pattern  = details.get("pattern", "breakout")
         priority = details.get("priority", 0)
         rvol     = details.get("rvol_ratio", 0.0)
         rng_pct  = details.get("range_pct", 0.0)
         log.info(
-            f"✅ SIGNAL: {symbol} | RVOL={rvol:.1f}x [{details.get('vol_tier','?')}] | "
+            f"✅ SIGNAL [{pattern.upper()}]: {symbol} | RVOL={rvol:.1f}x [{details.get('vol_tier','?')}] | "
             f"range={rng_pct:.1f}% | SL=-{details.get('sl_pct',0):.1f}% "
             f"TP1=+{details.get('tp1_pct',0):.1f}% TP2=trailing | "
             f"priority={priority}/2 | [{', '.join(details.get('entry_reasons',[]))}]"
         )
-        db_mark_signal(row_id, f"Breakout RVOL={rvol:.1f}x priority={priority}/2")
+        db_mark_signal(row_id, f"{pattern.title()} RVOL={rvol:.1f}x priority={priority}/2")
         candidates.append((priority, rvol, symbol, details))
 
     # Sort: highest priority first, then highest RVOL as tiebreaker
