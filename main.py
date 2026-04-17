@@ -1528,18 +1528,26 @@ def sync_open_positions(exchange: ccxt.binanceusdm) -> None:
             if float(p.get("contracts") or 0) > 0
         }
 
-        # Breakeven check — for open positions still running
+        # Breakeven check — detect TP1 fill by position size reduction
+        # Checking ticker price is unreliable (price may drop after TP1 fills).
+        # Instead: if Binance position qty dropped to ≤60% of original → TP1 was hit.
+        all_positions = exchange.fetch_positions()
+        live_qty_map  = {
+            p["symbol"]: float(p.get("contracts") or 0)
+            for p in all_positions
+            if float(p.get("contracts") or 0) > 0
+        }
         for sym, pos in list(open_positions.items()):
             if sym not in live_symbols:
                 continue
             if pos.get("breakeven_set"):
                 continue
-            tp1 = float(pos.get("tp1") or 0)
-            if tp1 <= 0:
+            original_qty  = float(pos.get("qty") or 0)
+            current_qty   = live_qty_map.get(sym, 0)
+            if original_qty <= 0 or current_qty <= 0:
                 continue
             try:
-                last_price = float(exchange.fetch_ticker(sym).get("last") or 0)
-                if last_price >= tp1:
+                if current_qty <= original_qty * 0.6:   # TP1 filled → half position gone
                     _move_sl_to_breakeven(exchange, sym, pos)
             except Exception as e:
                 log.warning(f"Breakeven check failed {sym}: {e}")
