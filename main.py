@@ -65,8 +65,9 @@ TREND_TOLERANCE      = 0.01     # allow up to 1% below SMA (not too strict)
 
 # ── Risk / Reward (structure-based SL)
 SL_BUFFER_PCT        = 0.002    # SL placed 0.2% below breakout candle low
-TP1_R                = 2.0      # TP1 at 2R → move SL to breakeven
-TRAIL_CALLBACK_PCT   = 2.0      # TP2 trailing stop callback % (replaces fixed 4R)
+TP1_R                = 2.0      # TP1 at 2R → move SL to breakeven (50% qty)
+TP2_R                = 3.0      # TP2 at 3R → locks more profit (25% qty)
+TRAIL_CALLBACK_PCT   = 2.0      # TP3 trailing stop callback % (25% qty runner)
 
 # ── Position sizing (risk-based)
 RISK_PER_TRADE_PCT   = 0.01     # risk 1% of free balance per trade
@@ -136,6 +137,7 @@ current_session: str             = ""
 sl_hit_symbols: dict[str, float] = {}
 _current_scan_id: int            = -1
 last_weekly_calc_day: int        = -1
+daily_report_sent_day: int       = -1   # guards the once-per-day Telegram summary
 trading_paused: bool             = False
 scanning_paused: bool            = False
 consecutive_losses: int          = 0    # resets on any win
@@ -473,6 +475,29 @@ def dashboard() -> str:
     today_utc   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     trade_today = len([t for t in trades if (t.get("timestamp") or "").startswith(today_utc)])
 
+    # ── Performance analytics (7d + 30d)
+    stats7  = compute_stats(7)
+    stats30 = compute_stats(30)
+
+    # Pattern breakdown from entry_reasons (RETEST vs BREAKOUT)
+    pattern_rows = _db_fetch(
+        "SELECT entry_reasons, status FROM trades WHERE direction='LONG' "
+        "AND timestamp >= datetime('now','-30 days')"
+    )
+    pat_stats: dict[str, dict] = {"BREAKOUT": {"w": 0, "l": 0}, "RETEST": {"w": 0, "l": 0}}
+    for pr in pattern_rows:
+        reasons = (pr.get("entry_reasons") or "").upper()
+        key = "RETEST" if "RETEST" in reasons or "BOUNCE" in reasons else "BREAKOUT"
+        st  = pr.get("status") or ""
+        if st == "sl_hit":
+            pat_stats[key]["l"] += 1
+        elif st in ("tp1_hit", "tp2_hit", "closed"):
+            pat_stats[key]["w"] += 1
+    def _pat_cell(key):
+        w = pat_stats[key]["w"]; l = pat_stats[key]["l"]; n = w + l
+        wr = round(w / n * 100, 1) if n else 0.0
+        return f"{w}W / {l}L · {wr}%"
+
     def fmt_ts(ts):
         if not ts: return "—"
         try: return ts[11:19] + " UTC"
@@ -602,6 +627,19 @@ def dashboard() -> str:
   </div>
 </section>
 <section>
+  <h2>Performance Analytics</h2>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
+    <div class="card"><div class="label">Win Rate · 7d</div><div class="value" style="color:{'#2ea043' if stats7['win_rate']>=50 else '#d29922'}">{stats7['win_rate']}%</div><div class="sub-val">{stats7['wins']}W / {stats7['losses']}L · open {stats7['open']}</div></div>
+    <div class="card"><div class="label">Avg R · 7d</div><div class="value" style="color:{'#2ea043' if stats7['avg_r']>=0 else '#da3633'}">{stats7['avg_r']:+.2f}R</div><div class="sub-val">Total: {stats7['total_r']:+.2f}R</div></div>
+    <div class="card"><div class="label">Win Rate · 30d</div><div class="value" style="color:{'#2ea043' if stats30['win_rate']>=50 else '#d29922'}">{stats30['win_rate']}%</div><div class="sub-val">{stats30['wins']}W / {stats30['losses']}L</div></div>
+    <div class="card"><div class="label">Avg R · 30d</div><div class="value" style="color:{'#2ea043' if stats30['avg_r']>=0 else '#da3633'}">{stats30['avg_r']:+.2f}R</div><div class="sub-val">Total: {stats30['total_r']:+.2f}R</div></div>
+    <div class="card"><div class="label">Best · 7d</div><div class="value" style="font-size:14px;color:#2ea043">{stats7['best_coin']}</div><div class="sub-val">Top R symbol</div></div>
+    <div class="card"><div class="label">Worst · 7d</div><div class="value" style="font-size:14px;color:#da3633">{stats7['worst_coin']}</div><div class="sub-val">Lowest R symbol</div></div>
+    <div class="card"><div class="label">Pattern · Breakout</div><div class="value" style="font-size:14px;color:#58a6ff">{_pat_cell('BREAKOUT')}</div><div class="sub-val">30d</div></div>
+    <div class="card"><div class="label">Pattern · Retest</div><div class="value" style="font-size:14px;color:#58a6ff">{_pat_cell('RETEST')}</div><div class="sub-val">30d</div></div>
+  </div>
+</section>
+<section>
   <h2>Breakout Signals (last 30)</h2>
   <table><tr><th>Time</th><th>Symbol</th><th>Dir</th><th>RVOL</th><th>Conditions</th></tr>
   {signals_rows}</table>
@@ -700,6 +738,326 @@ def send_telegram(message: str) -> None:
         resp.raise_for_status()
     except Exception as e:
         log.error(f"Telegram failed: {e}")
+
+
+# ─────────────────────────────────────────────
+#  ANALYTICS / REPORTS
+# ─────────────────────────────────────────────
+
+def _normalize_symbol(raw: str) -> str:
+    """Accept 'BTC', 'BTCUSDT', or full 'BTC/USDT:USDT'. Return canonical form."""
+    raw = (raw or "").strip().upper()
+    if not raw:
+        return ""
+    if raw.endswith("/USDT:USDT"):
+        return raw
+    if raw.endswith("USDT"):
+        return f"{raw[:-4]}/USDT:USDT"
+    return f"{raw}/USDT:USDT"
+
+
+def compute_stats(days: int = 7) -> dict:
+    """Aggregate trade performance over the last N days."""
+    out = {
+        "days": days, "total": 0, "wins": 0, "losses": 0, "open": 0,
+        "win_rate": 0.0, "avg_r": 0.0, "total_r": 0.0,
+        "best_coin": "—", "worst_coin": "—",
+    }
+    try:
+        conn = _db_conn()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM trades WHERE direction='LONG' "
+            "AND timestamp >= datetime('now', ?)",
+            (f"-{int(days)} days",),
+        ).fetchall()
+        conn.close()
+        if not rows:
+            return out
+
+        coin_r: dict[str, float] = {}
+        total_r = 0.0
+        wins = losses = open_ct = 0
+        for r in rows:
+            status = r["status"] or "open"
+            entry  = float(r["entry_price"] or 0)
+            sl     = float(r["sl"] or 0)
+            tp1    = float(r["tp1"] or 0)
+            sym    = r["symbol"]
+            if status == "open":
+                open_ct += 1
+                continue
+            if entry <= 0 or sl <= 0:
+                continue
+            risk = entry - sl
+            if risk <= 0:
+                continue
+            if status in ("tp1_hit", "tp2_hit", "closed"):
+                # Approximation: TP1 fill at +2R partial, winner closes
+                # Without per-fill ledger, estimate avg realized ≈ +1.5R (TP1 50% + trailer avg)
+                r_mult = TP1_R * 0.5 + 0.5   # ≈ 1.5R conservative
+                wins   += 1
+            elif status == "sl_hit":
+                r_mult = -1.0
+                losses += 1
+            else:
+                r_mult = 0.0
+            total_r += r_mult
+            coin_r[sym] = coin_r.get(sym, 0.0) + r_mult
+
+        total_closed = wins + losses
+        out["total"]    = len(rows)
+        out["wins"]     = wins
+        out["losses"]   = losses
+        out["open"]     = open_ct
+        out["win_rate"] = round(wins / total_closed * 100, 1) if total_closed else 0.0
+        out["total_r"]  = round(total_r, 2)
+        out["avg_r"]    = round(total_r / total_closed, 2) if total_closed else 0.0
+        if coin_r:
+            out["best_coin"]  = max(coin_r, key=coin_r.get)
+            out["worst_coin"] = min(coin_r, key=coin_r.get)
+        return out
+    except Exception as e:
+        log.debug(f"compute_stats: {e}")
+        return out
+
+
+def _format_stats_report(days: int = 7) -> str:
+    s = compute_stats(days)
+    if s["total"] == 0:
+        return f"*MUESA Stats ({days}d)*\nNo trades in the last {days} days."
+    return (
+        f"*MUESA Stats — last {days}d*\n"
+        f"─────────────────────\n"
+        f"Trades: `{s['total']}` (open: {s['open']})\n"
+        f"Wins: `{s['wins']}` · Losses: `{s['losses']}`\n"
+        f"Win rate: `{s['win_rate']}%`\n"
+        f"Avg R: `{s['avg_r']}R` · Total: `{s['total_r']}R`\n"
+        f"Best: `{s['best_coin']}`\n"
+        f"Worst: `{s['worst_coin']}`"
+    )
+
+
+def send_daily_report(for_day: datetime) -> None:
+    """Send a summary for the calendar day that just ended (UTC)."""
+    try:
+        day_str = for_day.strftime("%Y-%m-%d")
+        conn = _db_conn()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM trades WHERE direction='LONG' "
+            "AND substr(timestamp,1,10)=?",
+            (day_str,),
+        ).fetchall()
+        conn.close()
+
+        if not rows:
+            send_telegram(f"🗓 *MUESA Daily Report* — {day_str}\nNo trades taken.")
+            return
+
+        total  = len(rows)
+        wins   = sum(1 for r in rows if (r["status"] or "") in ("tp1_hit", "tp2_hit", "closed"))
+        losses = sum(1 for r in rows if (r["status"] or "") == "sl_hit")
+        opens  = sum(1 for r in rows if (r["status"] or "open") == "open")
+        win_rate = round(wins / (wins + losses) * 100, 1) if (wins + losses) else 0.0
+
+        lines = [
+            f"🗓 *MUESA Daily Report* — {day_str}",
+            "─────────────────────",
+            f"Trades: `{total}` · Wins: `{wins}` · Losses: `{losses}` · Open: `{opens}`",
+            f"Win rate: `{win_rate}%`",
+            "",
+            "*Trades:*",
+        ]
+        for r in rows:
+            st = r["status"] or "open"
+            emoji = {"tp1_hit": "✅", "tp2_hit": "✅", "closed": "✅",
+                     "sl_hit": "🔴", "open": "🟦"}.get(st, "•")
+            lines.append(f"{emoji} `{r['symbol']}` @ {r['entry_price']} — {st}")
+        send_telegram("\n".join(lines))
+    except Exception as e:
+        log.error(f"send_daily_report: {e}")
+
+
+# ─────────────────────────────────────────────
+#  TELEGRAM COMMAND LISTENER
+# ─────────────────────────────────────────────
+
+def _telegram_close_position(exchange: ccxt.binanceusdm, symbol: str) -> None:
+    """Cancel all open orders for symbol then market-close the position."""
+    if not symbol:
+        send_telegram("Usage: `/close SYMBOL` — e.g. `/close BTC` or `/close BTCUSDT`")
+        return
+    try:
+        # Check position exists on Binance
+        positions = exchange.fetch_positions([symbol])
+        live = next((p for p in positions if float(p.get("contracts") or 0) > 0), None)
+        if not live:
+            send_telegram(f"⚠ `{symbol}` has no open position on Binance.")
+            open_positions.pop(symbol, None)
+            return
+        qty = float(live.get("contracts") or 0)
+
+        # Cancel all open orders for this symbol
+        try:
+            for o in exchange.fetch_open_orders(symbol):
+                try:
+                    exchange.cancel_order(o.get("id"), symbol)
+                except Exception:
+                    pass
+        except Exception as e:
+            log.warning(f"/close cancel orders failed {symbol}: {e}")
+
+        # Market-close (reduce-only sell)
+        exchange.create_order(
+            symbol=symbol, type="market", side="sell", amount=qty,
+            params={"reduceOnly": True},
+        )
+        open_positions.pop(symbol, None)
+        db_update_trade_status(symbol, "closed")
+        send_telegram(f"✅ *Closed via /close*\n`{symbol}` qty=`{qty}` market-closed.")
+        log.info(f"Manual close via Telegram: {symbol} qty={qty}")
+    except Exception as e:
+        log.error(f"/close failed {symbol}: {e}")
+        send_telegram(f"⚠ `/close {symbol}` failed: `{e}`")
+
+
+def _handle_telegram_command(exchange: ccxt.binanceusdm, text: str) -> None:
+    global trading_paused, scanning_paused
+    parts = text.strip().split()
+    if not parts:
+        return
+    cmd  = parts[0].split("@")[0].lower()   # strip "@botname" if present
+    args = parts[1:]
+    try:
+        if cmd in ("/start", "/help"):
+            send_telegram(
+                "*MUESA Commands*\n"
+                "/status — bot state + open positions\n"
+                "/stats — 7-day performance\n"
+                "/pause — pause new trades\n"
+                "/resume — resume new trades\n"
+                "/pause\\_scan — pause scanner\n"
+                "/resume\\_scan — resume scanner\n"
+                "/close SYMBOL — market-close position\n"
+                "/help — this menu"
+            )
+
+        elif cmd == "/status":
+            is_paused   = db_get_state("trading_paused")  == "1"
+            scan_paused = db_get_state("scanning_paused") == "1"
+            lines = [
+                "*MUESA Status*",
+                "─────────────────────",
+                f"Trading : {'⏸ PAUSED' if is_paused else '▶ ACTIVE'}",
+                f"Scanner : {'⏹ PAUSED' if scan_paused else '▶ ACTIVE'}",
+                f"Open    : `{len(open_positions)}/{MAX_OPEN_POSITIONS}`",
+                f"Consec losses: `{consecutive_losses}` · Daily SL: `{daily_sl_count}/{MAX_DAILY_SL_HITS}`",
+                f"Session : `{current_session or 'Off-Hours'}`",
+            ]
+            if open_positions:
+                lines.append("")
+                lines.append("*Open positions:*")
+                for sym, pos in open_positions.items():
+                    try:
+                        last  = float(exchange.fetch_ticker(sym).get("last") or 0)
+                        entry = float(pos.get("entry") or 0)
+                        pnl   = ((last - entry) / entry * 100) if entry else 0.0
+                        be    = " BE✅" if pos.get("breakeven_set") else ""
+                        lines.append(f"• `{sym}` {entry} → {last} ({pnl:+.2f}%){be}")
+                    except Exception:
+                        lines.append(f"• `{sym}` (price fetch failed)")
+            send_telegram("\n".join(lines))
+
+        elif cmd == "/pause":
+            trading_paused = True
+            db_set_state("trading_paused", "1")
+            send_telegram("⏸ *MUESA* — Trading PAUSED.\nNo new trades will open.")
+
+        elif cmd == "/resume":
+            trading_paused = False
+            db_set_state("trading_paused", "0")
+            send_telegram("▶ *MUESA* — Trading RESUMED.")
+
+        elif cmd in ("/pause_scan", "/pausescan"):
+            scanning_paused = True
+            db_set_state("scanning_paused", "1")
+            send_telegram("⏹ *MUESA* — Scanner PAUSED.")
+
+        elif cmd in ("/resume_scan", "/resumescan"):
+            scanning_paused = False
+            db_set_state("scanning_paused", "0")
+            send_telegram("▶ *MUESA* — Scanner RESUMED.")
+
+        elif cmd == "/stats":
+            days = 7
+            if args:
+                try: days = max(1, min(90, int(args[0])))
+                except ValueError: pass
+            send_telegram(_format_stats_report(days))
+
+        elif cmd == "/close":
+            if not args:
+                send_telegram("Usage: `/close SYMBOL`\nExample: `/close BTC` or `/close BTCUSDT`")
+                return
+            sym = _normalize_symbol(args[0])
+            _telegram_close_position(exchange, sym)
+
+        elif cmd == "/report":
+            send_daily_report(datetime.now(timezone.utc))
+
+        else:
+            send_telegram(f"Unknown command: `{cmd}`\nTry /help")
+
+    except Exception as e:
+        log.error(f"Telegram command `{text}` failed: {e}")
+        send_telegram(f"⚠ Command `{cmd}` error: `{e}`")
+
+
+def telegram_command_loop(exchange: ccxt.binanceusdm) -> None:
+    """Long-poll Telegram for commands. Runs in a background thread."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.info("Telegram command loop disabled — no token/chat_id configured.")
+        return
+    url    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    offset = 0
+
+    # Skip backlog on startup so old commands don't fire after a restart
+    try:
+        r = requests.get(url, params={"timeout": 0, "limit": 1, "offset": -1}, timeout=10)
+        if r.ok:
+            results = r.json().get("result") or []
+            if results:
+                offset = results[-1]["update_id"] + 1
+    except Exception as e:
+        log.warning(f"Telegram initial offset fetch failed: {e}")
+
+    log.info("Telegram command loop active (long-poll 25s).")
+    while True:
+        try:
+            r = requests.get(
+                url, params={"timeout": 25, "offset": offset, "allowed_updates": '["message"]'},
+                timeout=35,
+            )
+            if not r.ok:
+                time.sleep(5); continue
+            updates = r.json().get("result") or []
+            for u in updates:
+                offset = u["update_id"] + 1
+                msg    = u.get("message") or {}
+                chat   = msg.get("chat") or {}
+                if str(chat.get("id", "")) != str(TELEGRAM_CHAT_ID):
+                    continue
+                text = (msg.get("text") or "").strip()
+                if not text.startswith("/"):
+                    continue
+                log.info(f"Telegram cmd: {text}")
+                _handle_telegram_command(exchange, text)
+        except requests.exceptions.Timeout:
+            continue
+        except Exception as e:
+            log.warning(f"Telegram command loop error: {e}")
+            time.sleep(5)
 
 # ─────────────────────────────────────────────
 #  EXCHANGE
@@ -1389,6 +1747,12 @@ def open_long(
         R         = entry_price - sl_price
         tp1_price = round(entry_price + TP1_R * R, 8)
 
+        # Split qty: 50% TP1, 25% TP2, 25% trailing
+        qty_tp1    = round(qty * 0.50, 6)
+        qty_tp2    = round(qty * 0.25, 6)
+        qty_trail  = round(qty - qty_tp1 - qty_tp2, 6)   # remainder → avoids rounding dust
+        tp2_price  = round(entry_price + TP2_R * R, 8)
+
         # SL — store order ID for breakeven move later
         sl_order = exchange.create_order(
             symbol=symbol, type="stop_market", side="sell", amount=qty,
@@ -1396,22 +1760,28 @@ def open_long(
         )
         sl_order_id = sl_order.get("id", "N/A")
 
-        # TP1 — half position at 2R
+        # TP1 — 50% at 2R
         exchange.create_order(
             symbol=symbol, type="take_profit_market", side="sell",
-            amount=round(qty / 2, 6),
+            amount=qty_tp1,
             params={"stopPrice": tp1_price, "reduceOnly": True},
         )
-        # TP2 — trailing stop on remaining half (callback = TRAIL_CALLBACK_PCT%)
+        # TP2 — 25% at 3R (locks additional profit)
+        exchange.create_order(
+            symbol=symbol, type="take_profit_market", side="sell",
+            amount=qty_tp2,
+            params={"stopPrice": tp2_price, "reduceOnly": True},
+        )
+        # TP3 — 25% trailing runner (rides momentum)
         exchange.create_order(
             symbol=symbol, type="trailing_stop_market", side="sell",
-            amount=round(qty / 2, 6),
+            amount=qty_trail,
             params={"callbackRate": TRAIL_CALLBACK_PCT, "reduceOnly": True},
         )
 
         open_positions[symbol] = {
             "direction": "LONG", "entry": entry_price, "qty": qty,
-            "sl": sl_price, "tp1": tp1_price, "tp2": "trailing",
+            "sl": sl_price, "tp1": tp1_price, "tp2": tp2_price, "tp3": "trailing",
             "order_id": order_id, "sl_order_id": sl_order_id,
             "breakeven_set": False,
             "opened_at": datetime.now(timezone.utc).isoformat(),
@@ -1420,7 +1790,7 @@ def open_long(
         entry_reasons = ", ".join(conditions)
         db_log_trade(
             _current_scan_id, symbol, entry_price, sl_price,
-            tp1_price, 0.0, qty, rvol, entry_reasons,   # tp2=0 = trailing
+            tp1_price, tp2_price, qty, rvol, entry_reasons,
         )
 
         sl_pct    = round((entry_price - sl_price) / entry_price * 100, 2)
@@ -1444,8 +1814,9 @@ def open_long(
             f"Entry   : `{entry_price}`\n"
             f"Qty     : `{qty}`\n"
             f"SL      : `{sl_price}` (-{sl_pct:.1f}%) ← {sl_label}\n"
-            f"TP1     : `{tp1_price}` (+{tp1_pct:.1f}%) ← 2R\n"
-            f"TP2     : Trailing stop ({TRAIL_CALLBACK_PCT}% callback)\n"
+            f"TP1     : `{tp1_price}` (+{tp1_pct:.1f}%) ← 2R (50%)\n"
+            f"TP2     : `{tp2_price}` (+{round((tp2_price-entry_price)/entry_price*100,1)}%) ← 3R (25%)\n"
+            f"TP3     : Trailing stop ({TRAIL_CALLBACK_PCT}% callback) ← runner (25%)\n"
             f"─────────────────────\n"
             f"*Entry Conditions*\n{cond_text}\n"
             f"─────────────────────\n"
@@ -1490,6 +1861,65 @@ def position_monitor_loop(exchange: ccxt.binanceusdm) -> None:
         if open_positions:
             _log_position_snapshots(exchange)
             sync_open_positions(exchange)
+
+
+def recover_open_positions(exchange: ccxt.binanceusdm) -> None:
+    """
+    On startup: reload any live Binance positions into open_positions.
+    Prevents duplicate opens and lets position_monitor track them to exit.
+    Original TP1 may be unknown — for recovered positions, breakeven
+    auto-move is skipped; positions still exit via existing Binance orders.
+    """
+    try:
+        positions = exchange.fetch_positions()
+        recovered = 0
+        for p in positions:
+            contracts = float(p.get("contracts") or 0)
+            if contracts <= 0:
+                continue
+            symbol = p.get("symbol")
+            entry  = float(p.get("entryPrice") or 0)
+            if not symbol or entry <= 0:
+                continue
+            if symbol in open_positions:
+                continue   # already tracked
+
+            sl_price    = 0.0
+            tp1_price   = 0.0
+            tp2_price   = 0.0
+            sl_order_id = None
+            try:
+                orders = exchange.fetch_open_orders(symbol)
+                for o in orders:
+                    otype = (o.get("type") or "").lower()
+                    if "stop" in otype and "trailing" not in otype and "take_profit" not in otype:
+                        sl_price    = float(o.get("stopPrice") or o.get("triggerPrice") or 0)
+                        sl_order_id = o.get("id")
+                    elif "take_profit" in otype:
+                        tp = float(o.get("stopPrice") or o.get("triggerPrice") or 0)
+                        if tp1_price == 0 or tp < tp1_price:
+                            tp2_price = max(tp, tp2_price)
+                            tp1_price = tp if tp1_price == 0 else min(tp1_price, tp)
+                        elif tp > tp1_price:
+                            tp2_price = max(tp2_price, tp)
+            except Exception as e:
+                log.warning(f"Recovery: fetching orders for {symbol} failed: {e}")
+
+            open_positions[symbol] = {
+                "direction": "LONG", "entry": entry, "qty": contracts,
+                "sl": sl_price, "tp1": tp1_price, "tp2": tp2_price, "tp3": "trailing",
+                "order_id": "recovered", "sl_order_id": sl_order_id,
+                "breakeven_set": False,
+                "opened_at": datetime.now(timezone.utc).isoformat(),
+                "recovered": True,
+            }
+            recovered += 1
+            log.info(f"Recovered position: {symbol} qty={contracts} entry={entry} sl={sl_price} tp1={tp1_price}")
+
+        if recovered > 0:
+            send_telegram(f"🔄 *MUESA Recovery* — {recovered} open position(s) reloaded from Binance")
+    except Exception as e:
+        log.error(f"Position recovery failed: {e}")
 
 
 def _move_sl_to_breakeven(exchange: ccxt.binanceusdm, symbol: str, pos: dict) -> None:
@@ -1604,8 +2034,22 @@ def get_top_symbols(exchange: ccxt.binanceusdm) -> list[tuple[str, float]]:
 # ─────────────────────────────────────────────
 
 def maybe_reset_daily(now: datetime) -> None:
-    global last_reset_day, last_weekly_calc_day, daily_sl_count
+    global last_reset_day, last_weekly_calc_day, daily_sl_count, daily_report_sent_day
     if now.day != last_reset_day:
+        # Send report for the day that JUST ended (skip on first boot: last_reset_day == -1)
+        if last_reset_day != -1 and last_reset_day != daily_report_sent_day:
+            try:
+                # The "previous day" is roughly 1 day before `now`; day number matches last_reset_day
+                prev = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                # Step back one day for the report window
+                from datetime import timedelta
+                prev = prev - timedelta(days=1)
+                threading.Thread(target=send_daily_report, args=(prev,), daemon=True).start()
+                daily_report_sent_day = last_reset_day
+                log.info(f"Daily report dispatched for {prev.strftime('%Y-%m-%d')}")
+            except Exception as e:
+                log.error(f"Daily report dispatch failed: {e}")
+
         last_reset_day  = now.day
         daily_sl_count  = 0    # reset daily SL counter at midnight
         log.info("Daily reset — SL counter cleared.")
@@ -1793,8 +2237,15 @@ def main() -> None:
         send_telegram(f"*MUESA CRITICAL* — Binance failed:\n`{e}`")
         return
 
+    # Auto-recover any open positions left on Binance from previous session
+    recover_open_positions(exchange)
+
     threading.Thread(target=position_monitor_loop, args=(exchange,), daemon=True).start()
     log.info(f"Position monitor started — checking every {POSITION_CHECK_INTERVAL}s.")
+
+    # Start Telegram command polling in background
+    threading.Thread(target=telegram_command_loop, args=(exchange,), daemon=True).start()
+    log.info("Telegram command listener started.")
 
     while True:
         if scanning_paused:
